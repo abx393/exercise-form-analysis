@@ -1,28 +1,48 @@
 """
 classify_exercise.py
 ---------------------
-Classifies repetition-based exercises from multi-device accelerometer data.
+Classifies repetition-based exercises from multi-device accelerometer
+(and optionally gyroscope) data.
 
 Directory structure expected:
     <data_dir>/
         <exercise_name>/          e.g. situp, pushup, squat
             <recording_id>/       e.g. 1, 2, 3
-                <device_files>    CSV files with columns:
-                                  absolute_timestamp, accel_x, accel_y, accel_z
+                <sensor_files>    CSV files — see below
 
-Device type is inferred from filename keywords:
-    "bose" | "headphone"  → headphones
-    "garmin" | "watch"    → watch
-    "samsung" | "phone"   → phone
+Supported file formats
+----------------------
+Garmin / Samsung / Bose (already-converted):
+    Columns: absolute_timestamp, accel_x, accel_y, accel_z
+    Gyro:    absolute_timestamp, gyro_x, gyro_y, gyro_z
 
-Rep segmentation uses the same pipeline as plot_multi_accel.py:
+Apple iPhone (Accelerometer.csv / Gyroscope.csv):
+    Columns: time, seconds_elapsed, x, y, z
+    Timestamp: per-row nanosecond epoch in `time`, or fixed epoch + seconds_elapsed
+
+Apple AirPods (Headphone.csv):
+    Columns: time, seconds_elapsed, accelerationX/Y/Z, rotationRateX/Y/Z, ...
+    Yields two signal streams: headphones/accel and headphones/gyro
+
+Device and sensor type are inferred from filename keywords:
+    Device:
+      "bose" | "headphone" | "Headphone"   → headphones
+      "garmin" | "watch"                   → watch
+      "samsung" | "phone" | "Accelerometer"
+        | "Gyroscope"                      → phone
+    Sensor:
+      "gyro" | "Gyroscope" | "rotationRate"
+        | "gyroscope" in name              → gyro
+      otherwise                            → accel
+
+Rep segmentation uses the primary device's accelerometer signal:
     1. Low-pass filter the vector magnitude
-    2. Estimate rep period from the autocorrelation of the primary device
+    2. Estimate rep period from the autocorrelation
     3. Detect valleys with that period as the minimum separation
-    4. Slice valley-to-valley segments on all devices
+    4. Apply the same time-boundary segments to all signals
 
-Features are computed per rep per device (orientation-invariant where possible)
-and concatenated into a single feature vector. One row per rep.
+Features are keyed as {device}_{sensor}_{feature}, e.g.:
+    watch_accel_mag_mean, headphones_gyro_corr_xy
 
 Model: Random Forest (recording-level train/test split to avoid data leakage).
 
@@ -48,7 +68,6 @@ import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import GroupShuffleSplit
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
@@ -60,17 +79,32 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 GARMIN_EPOCH_OFFSET = 631065600   # seconds between 1989-12-31 and 1970-01-01
 
+# Maps lowercase filename substrings → canonical device label
 DEVICE_KEYWORDS = {
-    'headphones': ['bose', 'headphone'],
+    'headphones': ['bose', 'headphone'],   # covers "Headphone.csv" too
     'watch':      ['garmin', 'watch'],
-    'phone':      ['samsung', 'phone'],
+    'phone':      ['samsung', 'phone',
+                   'accelerometer', 'gyroscope'],  # Apple sensor filenames
 }
 
+# Maps lowercase filename substrings → canonical sensor label
+# Checked after device inference; anything not matched defaults to 'accel'
+GYRO_KEYWORDS = ['gyro', 'gyroscope', 'rotationrate']
+
+
 # ---------------------------------------------------------------------------
-# Timestamp detection  (identical to plot_multi_accel.py)
+# Timestamp handling
 # ---------------------------------------------------------------------------
 
 def detect_and_convert_timestamps(raw_timestamps):
+    """
+    Convert raw timestamp values to Unix epoch seconds (float).
+
+    Handles:
+      - Nanoseconds  (~1e18): divide by 1e9
+      - Milliseconds (~1e12): divide by 1e3
+      - Seconds/Garmin epoch (~1e9): offset if pre-2010
+    """
     sample = raw_timestamps[len(raw_timestamps) // 2]
     if sample >= 1e15:
         return [t / 1e9 for t in raw_timestamps]
@@ -83,23 +117,97 @@ def detect_and_convert_timestamps(raw_timestamps):
         return converted
 
 
+def build_timestamps_from_time_elapsed(time_col, elapsed_col):
+    """
+    Build per-row nanosecond timestamps from Apple-style (time, seconds_elapsed)
+    columns, handling both fixed-epoch and per-row `time` values.
+
+    When `time` is the same for every row (fixed recording-start epoch), the
+    per-row offset comes from seconds_elapsed converted to nanoseconds using
+    int64 arithmetic to avoid float64 precision loss at ~1e18 scale.
+    When `time` already varies per row it is used directly.
+
+    Returns a list of Unix-epoch-second floats (consistent with
+    detect_and_convert_timestamps output).
+    """
+    time_int = [int(t) for t in time_col]
+    if len(set(time_int)) == 1:
+        # Fixed epoch: add seconds_elapsed as integer nanoseconds
+        base_ns    = time_int[0]
+        timestamps = [
+            (base_ns + round(e * 1_000_000_000)) / 1e9
+            for e in elapsed_col
+        ]
+    else:
+        # Per-row nanosecond timestamps
+        timestamps = [t / 1e9 for t in time_int]
+    return timestamps
+
+
 # ---------------------------------------------------------------------------
 # CSV loading
 # ---------------------------------------------------------------------------
 
-def load_device_csv(filepath):
-    """Return (timestamps_unix_s, xs, ys, zs) sorted by timestamp."""
-    raw_ts, xs, ys, zs = [], [], [], []
+# Column name aliases → canonical names used internally
+_ACCEL_ALIASES = {
+    'x': 'xs', 'y': 'ys', 'z': 'zs',
+    'accel_x': 'xs', 'accel_y': 'ys', 'accel_z': 'zs',
+    'accelerationx': 'xs', 'accelerationy': 'ys', 'accelerationz': 'zs',
+}
+_GYRO_ALIASES = {
+    'x': 'xs', 'y': 'ys', 'z': 'zs',
+    'gyro_x': 'xs', 'gyro_y': 'ys', 'gyro_z': 'zs',
+    'rotationratex': 'xs', 'rotationratey': 'ys', 'rotationratez': 'zs',
+}
+
+
+def _load_raw_csv(filepath):
+    """
+    Read a CSV and return (col_lower_map, rows) where col_lower_map maps
+    lower-case column name → original column name, and rows is a list of dicts.
+    """
     with open(filepath, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            raw_ts.append(float(row['absolute_timestamp']))
-            xs.append(float(row['accel_x']))
-            ys.append(float(row['accel_y']))
-            zs.append(float(row['accel_z']))
-    if not raw_ts:
-        raise ValueError(f"No data in {filepath}")
-    timestamps = detect_and_convert_timestamps(raw_ts)
+        rows   = list(reader)
+    if not rows:
+        return {}, []
+    col_lower = {c.lower(): c for c in rows[0].keys()}
+    return col_lower, rows
+
+
+def _extract_timestamps(col_lower, rows):
+    """
+    Return a list of Unix-epoch-second floats from whichever timestamp
+    convention the file uses (absolute_timestamp or time+seconds_elapsed).
+    """
+    if 'absolute_timestamp' in col_lower:
+        raw = [float(r[col_lower['absolute_timestamp']]) for r in rows]
+        return detect_and_convert_timestamps(raw)
+    elif 'time' in col_lower and 'seconds_elapsed' in col_lower:
+        time_col    = [float(r[col_lower['time']])            for r in rows]
+        elapsed_col = [float(r[col_lower['seconds_elapsed']]) for r in rows]
+        return build_timestamps_from_time_elapsed(time_col, elapsed_col)
+    else:
+        raise ValueError("No recognised timestamp columns "
+                         f"(need absolute_timestamp or time+seconds_elapsed). "
+                         f"Found: {list(col_lower.keys())}")
+
+
+def _extract_axes(col_lower, rows, alias_map):
+    """
+    Extract x/y/z axes using alias_map. Returns (xs, ys, zs) lists or
+    raises ValueError if the required columns are not present.
+    """
+    found = {}
+    for src_lower, dst in alias_map.items():
+        if src_lower in col_lower and dst not in found:
+            found[dst] = [float(r[col_lower[src_lower]]) for r in rows]
+    if not all(k in found for k in ('xs', 'ys', 'zs')):
+        return None, None, None
+    return found['xs'], found['ys'], found['zs']
+
+
+def _sort_by_time(timestamps, xs, ys, zs):
     order = sorted(range(len(timestamps)), key=lambda i: timestamps[i])
     return (
         np.array([timestamps[i] for i in order]),
@@ -109,35 +217,163 @@ def load_device_csv(filepath):
     )
 
 
-def infer_device_type(filename):
-    """Return a canonical device key or None if unrecognised."""
-    name = filename.lower()
-    for device, keywords in DEVICE_KEYWORDS.items():
-        if any(kw in name for kw in keywords):
-            return device
-    return None
+def load_signal_csv(filepath, sensor):
+    """
+    Load a single-sensor CSV file (accel or gyro).
 
+    Returns (ts, xs, ys, zs) as numpy arrays sorted by timestamp,
+    or None if the required columns are not found.
+
+    Parameters
+    ----------
+    filepath : path to CSV
+    sensor   : 'accel' or 'gyro' — determines which alias map to use
+    """
+    col_lower, rows = _load_raw_csv(filepath)
+    if not rows:
+        return None
+
+    try:
+        timestamps = _extract_timestamps(col_lower, rows)
+    except ValueError as e:
+        print(f"    [skip] {filepath.name}: {e}")
+        return None
+
+    alias_map = _ACCEL_ALIASES if sensor == 'accel' else _GYRO_ALIASES
+    xs, ys, zs = _extract_axes(col_lower, rows, alias_map)
+    if xs is None:
+        return None
+
+    return _sort_by_time(timestamps, xs, ys, zs)
+
+
+def load_headphone_csv(filepath):
+    """
+    Load an Apple Headphone.csv which contains both accelerometer and
+    gyroscope signals in a single file.
+
+    Returns a dict:
+        {'accel': (ts, xs, ys, zs), 'gyro': (ts, xs, ys, zs)}
+    Either value may be None if the columns are not found.
+    """
+    col_lower, rows = _load_raw_csv(filepath)
+    if not rows:
+        return {}
+
+    try:
+        timestamps = _extract_timestamps(col_lower, rows)
+    except ValueError as e:
+        print(f"    [skip headphone] {filepath.name}: {e}")
+        return {}
+
+    result = {}
+    for sensor, alias_map in [('accel', _ACCEL_ALIASES),
+                               ('gyro',  _GYRO_ALIASES)]:
+        xs, ys, zs = _extract_axes(col_lower, rows, alias_map)
+        if xs is not None:
+            result[sensor] = _sort_by_time(timestamps, xs, ys, zs)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Device / sensor type inference
+# ---------------------------------------------------------------------------
+
+def infer_device_and_sensor(filename):
+    """
+    Infer (device_label, sensor_label) from a filename.
+
+    device_label : 'headphones' | 'watch' | 'phone' | None
+    sensor_label : 'accel' | 'gyro'
+
+    Apple Headphone.csv is a special case: it is flagged as
+    (device='headphones', sensor='dual') so the caller knows to use
+    load_headphone_csv() instead of load_signal_csv().
+
+    Returns (None, None) if the device cannot be determined.
+    """
+    name_lower = filename.lower()
+
+    # Infer device
+    device = None
+    for dev, keywords in DEVICE_KEYWORDS.items():
+        if any(kw in name_lower for kw in keywords):
+            device = dev
+            break
+    if device is None:
+        return None, None
+
+    # Apple Headphone.csv contains both accel and gyro
+    if 'headphone' in name_lower and device == 'headphones':
+        # Distinguish Apple Headphone.csv (has accelerationX columns) from
+        # Bose headphone accel/gyro files (already named accel_*/gyro_*)
+        # We flag it as 'dual' and let load_recording handle the split.
+        # Bose files have explicit 'accel' or 'gyro' in the filename.
+        if not any(kw in name_lower for kw in ['accel', 'gyro']):
+            return device, 'dual'
+
+    # Infer sensor type
+    sensor = 'gyro' if any(kw in name_lower for kw in GYRO_KEYWORDS) \
+             else 'accel'
+
+    return device, sensor
+
+
+# ---------------------------------------------------------------------------
+# Recording loader
+# ---------------------------------------------------------------------------
 
 def load_recording(recording_dir):
     """
-    Load all recognised device files in a recording directory.
+    Load all recognised sensor files in a recording directory.
 
     Returns
     -------
-    dict  keyed by device type → {'ts', 'xs', 'ys', 'zs'}
+    dict keyed by (device, sensor) tuple →
+         {'ts': array, 'xs': array, 'ys': array, 'zs': array}
+
+    Examples of keys:
+        ('watch', 'accel'), ('headphones', 'accel'), ('headphones', 'gyro'),
+        ('phone', 'accel'), ('phone', 'gyro')
     """
-    devices = {}
+    signals = {}
+
     for fpath in sorted(Path(recording_dir).iterdir()):
         if fpath.suffix.lower() != '.csv':
             continue
-        dtype = infer_device_type(fpath.name)
-        if dtype is None:
-            print(f"    [skip] unrecognised device: {fpath.name}")
+
+        device, sensor = infer_device_and_sensor(fpath.name)
+
+        if device is None:
+            print(f"    [skip] unrecognised file: {fpath.name}")
             continue
-        print('fpath', fpath)
-        ts, xs, ys, zs = load_device_csv(fpath)
-        devices[dtype] = {'ts': ts, 'xs': xs, 'ys': ys, 'zs': zs, 'label': dtype}
-    return devices
+
+        if sensor == 'dual':
+            # Apple Headphone.csv — yields both accel and gyro
+            streams = load_headphone_csv(fpath)
+            for s, data in streams.items():
+                if data is not None:
+                    key = (device, s)
+                    if key in signals:
+                        print(f"    [skip] duplicate {key}: {fpath.name}")
+                    else:
+                        ts, xs, ys, zs = data
+                        signals[key] = {'ts': ts, 'xs': xs,
+                                        'ys': ys, 'zs': zs}
+        else:
+            key  = (device, sensor)
+            if key in signals:
+                print(f"    [skip] duplicate {key}: {fpath.name}")
+                continue
+            data = load_signal_csv(fpath, sensor)
+            if data is None:
+                print(f"    [skip] could not load {key} from {fpath.name}")
+                continue
+            ts, xs, ys, zs = data
+            signals[key] = {'ts': ts, 'xs': xs, 'ys': ys, 'zs': zs}
+
+    return signals
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +415,43 @@ def estimate_rep_period_acf(mag_f, fs, min_period_s=0.3, max_period_s=10.0):
     return period_s
 
 
+def bandpass_filter(mag, fs, period_s,
+                    lower_cycles=0.5, upper_cycles=2.5):
+    """
+    Adaptive bandpass filter whose cutoffs are derived from the estimated
+    rep period, making the filter exercise-agnostic.
+
+      low  = lower_cycles / period_s  Hz  (default 0.5× rep frequency)
+             Removes DC drift and slow tilt changes.
+      high = upper_cycles / period_s  Hz  (default 2.5× rep frequency)
+             Keeps the fundamental and first two harmonics, cuts noise.
+
+    Both cutoffs are clamped to valid Butterworth ranges before use.
+    Falls back to returning mag unchanged if the range is degenerate.
+    """
+    nyq     = fs / 2.0
+    low_hz  = max(lower_cycles / period_s, 0.01)
+    high_hz = min(upper_cycles / period_s, nyq * 0.95)
+
+    if low_hz >= high_hz:
+        return mag.copy()
+
+    b, a = butter(2, [low_hz / nyq, high_hz / nyq], btype='band')
+    return filtfilt(b, a, mag)
+
+
 def detect_valleys(times, xs, ys, zs, lowpass_hz=5.0,
                    min_separation_s=None, prominence_factor=0.5):
     """
-    Return (valley_idx, mag_f) for the given device signal.
-    min_separation_s=None → derived from ACF.
+    Detect valleys for rep segmentation.
+
+    Pipeline:
+      1. Low-pass filter → mag_f  (returned; used for feature extraction)
+      2. ACF on mag_f   → rep period estimate
+      3. Bandpass filter using ACF-derived period → mag_bp
+         (used for valley detection only — cleaner baseline, less noise)
+
+    Returns (valley_idx, mag_f, min_separation_s_used)
     """
     fs    = compute_fs(times)
     mag   = np.sqrt(xs**2 + ys**2 + zs**2)
@@ -192,11 +460,15 @@ def detect_valleys(times, xs, ys, zs, lowpass_hz=5.0,
     if min_separation_s is None:
         period_s         = estimate_rep_period_acf(mag_f, fs)
         min_separation_s = period_s / 2.0
+    else:
+        period_s = min_separation_s * 2.0
+
+    mag_bp = bandpass_filter(mag_f, fs, period_s)
 
     dist    = max(1, int(min_separation_s * fs))
-    iqr     = float(np.percentile(mag_f, 75) - np.percentile(mag_f, 25))
+    iqr     = float(np.percentile(mag_bp, 75) - np.percentile(mag_bp, 25))
     prom    = max(iqr * prominence_factor, 1e-6)
-    vidx, _ = find_peaks(-mag_f, distance=dist, prominence=prom)
+    vidx, _ = find_peaks(-mag_bp, distance=dist, prominence=prom)
     return vidx, mag_f, min_separation_s
 
 
@@ -315,51 +587,69 @@ def _safe_kurtosis(x):
     return float(np.mean(((x - mu) / sd) ** 4) - 3.0)
 
 
-def features_for_recording(devices, primary_device='watch',
-                             lowpass_hz=5.0, prominence_factor=0.5):
+def features_for_recording(signals, primary_device='watch',
+                            lowpass_hz=5.0, prominence_factor=0.5):
     """
-    Segment reps from the primary device and extract features from all devices.
+    Segment reps from the primary device's accelerometer signal and extract
+    features from all available (device, sensor) streams.
+
+    Parameters
+    ----------
+    signals       : dict keyed by (device, sensor) tuples, as returned by
+                    load_recording()
+    primary_device: device label to use for segmentation (default: 'watch').
+                    Always uses the 'accel' sensor of this device.
+                    Falls back to the first available accel signal if the
+                    chosen device is not present.
 
     Returns
     -------
-    list of dicts, one per rep.  Each dict contains prefixed feature names
-    like 'watch_mag_mean', 'headphones_corr_xy', etc., plus 'rep_duration_s'.
+    list of dicts, one per rep. Feature names are prefixed as
+    {device}_{sensor}_{feature}, e.g. 'watch_accel_mag_mean'.
+    'rep_duration_s' is added once, unprefixed, as a shared feature.
     Returns empty list if segmentation fails.
     """
+    if not signals:
+        return []
+
     # ------------------------------------------------------------------
-    # Trim all devices to the overlapping time window
+    # Find the overlapping time window across all signals
     # ------------------------------------------------------------------
-    t_start = max(d['ts'][0]  for d in devices.values())
-    t_end   = min(d['ts'][-1] for d in devices.values())
+    t_start = max(d['ts'][0]  for d in signals.values()) + 2
+    t_end   = min(d['ts'][-1] for d in signals.values()) - 2
     if t_start >= t_end:
         print("    [skip] no overlapping time window")
         return []
 
+    # Trim all signals to the common window and normalise time to 0
     trimmed = {}
-    for name, d in devices.items():
+    for key, d in signals.items():
         ts, xs, ys, zs = trim_to_window(
             d['ts'], d['xs'], d['ys'], d['zs'], t_start, t_end)
         if len(ts) < 10:
-            print(f"    [skip] {name} has too few samples after trim")
+            print(f"    [skip] {key} has too few samples after trim")
             return []
         times = ts - ts[0]
-        trimmed[name] = {'times': times, 'xs': xs, 'ys': ys, 'zs': zs}
+        trimmed[key] = {'times': times, 'xs': xs, 'ys': ys, 'zs': zs}
 
     # ------------------------------------------------------------------
-    # Segment on primary device
+    # Select the primary accel signal for segmentation
     # ------------------------------------------------------------------
-    if primary_device not in trimmed:
-        # Fall back to first available device
-        primary_device = next(iter(trimmed))
-        print(f"    [warn] primary device not found, using {primary_device}")
+    primary_key = (primary_device, 'accel')
+    if primary_key not in trimmed:
+        # Fall back to any available accel signal
+        accel_keys  = [k for k in trimmed if k[1] == 'accel']
+        if not accel_keys:
+            print("    [skip] no accelerometer signal available for segmentation")
+            return []
+        primary_key = accel_keys[0]
+        print(f"    [warn] primary {(primary_device, 'accel')} not found, "
+              f"using {primary_key}")
 
-    pd      = trimmed[primary_device]
-    fs_p    = compute_fs(pd['times'])
-    mag_p   = np.sqrt(pd['xs']**2 + pd['ys']**2 + pd['zs']**2)
-    mag_p_f = lowpass_filter(mag_p, fs_p, lowpass_hz)
+    pd_sig = trimmed[primary_key]
 
     valley_idx, _, min_sep = detect_valleys(
-        pd['times'], pd['xs'], pd['ys'], pd['zs'],
+        pd_sig['times'], pd_sig['xs'], pd_sig['ys'], pd_sig['zs'],
         lowpass_hz=lowpass_hz,
         prominence_factor=prominence_factor,
     )
@@ -370,44 +660,45 @@ def features_for_recording(devices, primary_device='watch',
         return []
 
     print(f"    {len(segments)} reps detected "
-          f"(min_sep={min_sep:.2f}s, primary={primary_device})")
+          f"(min_sep={min_sep:.2f}s, primary={primary_key})")
 
     # ------------------------------------------------------------------
-    # Extract features per rep per device
+    # Extract features per rep per (device, sensor)
     # ------------------------------------------------------------------
+
+    # Build the NaN stub keys once — used when a signal has too few samples
+    # in a rep window. Keys follow the {device}_{sensor}_{feat} convention.
+    _feat_suffixes = [
+        'mag_mean', 'mag_std', 'mag_min', 'mag_max', 'mag_range',
+        'mag_rms', 'mag_skew', 'mag_kurt', 'mag_dom_freq', 'mag_top3_pwr',
+        'mag_frac_above_mean',
+        'x_mean', 'x_std', 'x_zcr',
+        'y_mean', 'y_std', 'y_zcr',
+        'z_mean', 'z_std', 'z_zcr',
+        'corr_xy', 'corr_xz', 'corr_yz',
+    ]
+
     all_rep_features = []
 
-    for seg_i, (s_idx, e_idx) in enumerate(segments):
-        # Map primary-device sample indices to time boundaries
-        t_rep_start = pd['times'][s_idx]
-        t_rep_end   = pd['times'][min(e_idx, len(pd['times']) - 1)]
+    for s_idx, e_idx in segments:
+        t_rep_start = pd_sig['times'][s_idx]
+        t_rep_end   = pd_sig['times'][min(e_idx, len(pd_sig['times']) - 1)]
         rep_dur     = float(t_rep_end - t_rep_start)
-
         if rep_dur <= 0:
             continue
 
         rep_feats = {'rep_duration_s': rep_dur}
 
-        for dev_name, ddata in trimmed.items():
-            # Slice this device using the primary-device time boundaries
-            mask = (ddata['times'] >= t_rep_start) & \
-                   (ddata['times'] <= t_rep_end)
+        for (device, sensor), ddata in trimmed.items():
+            prefix = f'{device}_{sensor}'
+            mask   = ((ddata['times'] >= t_rep_start) &
+                      (ddata['times'] <= t_rep_end))
             xs_s = ddata['xs'][mask]
             ys_s = ddata['ys'][mask]
             zs_s = ddata['zs'][mask]
 
             if len(xs_s) < 4:
-                # Not enough samples from this device for this rep window
-                # Fill with NaN so the row is still usable after imputation
-                stub = {f'{dev_name}_{k}': np.nan
-                        for k in ['mag_mean', 'mag_std', 'mag_min', 'mag_max',
-                                  'mag_range', 'mag_rms', 'mag_skew',
-                                  'mag_kurt', 'mag_dom_freq', 'mag_top3_pwr',
-                                  'mag_frac_above_mean',
-                                  'x_mean', 'x_std', 'x_zcr',
-                                  'y_mean', 'y_std', 'y_zcr',
-                                  'z_mean', 'z_std', 'z_zcr',
-                                  'corr_xy', 'corr_xz', 'corr_yz']}
+                stub = {f'{prefix}_{k}': np.nan for k in _feat_suffixes}
                 rep_feats.update(stub)
                 continue
 
@@ -419,11 +710,9 @@ def features_for_recording(devices, primary_device='watch',
             dev_feats = extract_device_features(
                 mag_s_f, xs_s, ys_s, zs_s, fs_d, rep_dur)
 
-            # Prefix feature names with device name; skip rep_duration_s
-            # (already added once above, shared across devices)
             for k, v in dev_feats.items():
                 if k != 'rep_duration_s':
-                    rep_feats[f'{dev_name}_{k}'] = v
+                    rep_feats[f'{prefix}_{k}'] = v
 
         all_rep_features.append(rep_feats)
 
@@ -445,6 +734,7 @@ def build_dataset(data_dir, primary_device='watch',
     labels      : list of exercise name strings (one per rep)
     group_ids   : list of recording ID strings (one per rep, for grouped CV)
     """
+
     data_dir = Path(data_dir)
     rows, labels, group_ids = [], [], []
 
@@ -453,34 +743,38 @@ def build_dataset(data_dir, primary_device='watch',
 
     for ex_dir in exercise_dirs:
         exercise = ex_dir.name
-        rec_dirs = sorted(
+        subj_dirs = sorted(
             p for p in ex_dir.iterdir() if p.is_dir())
+        
+        for subj_dir in subj_dirs:
+            rec_dirs = sorted(
+                p for p in subj_dir.iterdir() if p.is_dir())
 
-        if not rec_dirs:
-            print(f"  [{exercise}] no recording subdirectories found, skipping")
-            continue
-
-        print(f"\n[{exercise}]")
-        for rec_dir in rec_dirs:
-            rec_id = f"{exercise}/{rec_dir.name}"
-            print(f"  Recording: {rec_dir.name}")
-
-            devices = load_recording(rec_dir)
-            if len(devices) == 0:
-                print("    [skip] no recognised device files")
+            if not rec_dirs:
+                print(f"  [{exercise}] no recording subdirectories found, skipping")
                 continue
 
-            rep_feats = features_for_recording(
-                devices,
-                primary_device=primary_device,
-                lowpass_hz=lowpass_hz,
-                prominence_factor=prominence_factor,
-            )
+            print(f"\n[{exercise}]")
+            for rec_dir in rec_dirs:
+                rec_id = f"{exercise}/{subj_dir.name}/{rec_dir.name}"
+                print(f"  Recording: {rec_dir.name}")
 
-            for rf in rep_feats:
-                rows.append(rf)
-                labels.append(exercise)
-                group_ids.append(rec_id)
+                signals = load_recording(rec_dir)
+                if len(signals) == 0:
+                    print("    [skip] no recognised sensor files")
+                    continue
+
+                rep_feats = features_for_recording(
+                    signals,
+                    primary_device=primary_device,
+                    lowpass_hz=lowpass_hz,
+                    prominence_factor=prominence_factor,
+                )
+
+                for rf in rep_feats:
+                    rows.append(rf)
+                    labels.append(exercise)
+                    group_ids.append(rec_id)
 
     return rows, labels, group_ids
 
@@ -492,21 +786,29 @@ def build_dataset(data_dir, primary_device='watch',
 def train_and_evaluate(rows, labels, group_ids,
                        test_size=0.2, n_estimators=200, random_state=42):
     """
-    Train a Random Forest with a recording-level grouped train/test split.
+    Train a Random Forest with a stratified, recording-level train/test split.
+
+    Stratification is applied at the recording level: recordings are grouped
+    by exercise class, and a proportional number of recordings from each class
+    are held out for the test set. This ensures every class is represented in
+    both splits regardless of how many recordings each class has.
 
     Returns
     -------
-    clf          : fitted RandomForestClassifier
-    feature_names: list of feature name strings
-    X_test       : test feature matrix
-    y_test       : true labels for test set
-    y_pred       : predicted labels for test set
+    clf           : fitted RandomForestClassifier
+    feature_names : list of feature name strings
+    imputer       : fitted SimpleImputer (for saving/reuse)
+    X_test        : test feature matrix
+    y_test        : true labels for test set
+    y_pred        : predicted labels for test set
     """
     import pandas as pd
     from sklearn.impute import SimpleImputer
+    from collections import defaultdict
 
     # Build DataFrame to align columns across all reps
-    df = pd.DataFrame(rows).fillna(method='ffill').fillna(0.0)
+    df = pd.DataFrame(rows)
+    df = df.ffill().fillna(0.0)
     feature_names = list(df.columns)
 
     X = df.values.astype(float)
@@ -517,20 +819,58 @@ def train_and_evaluate(rows, labels, group_ids,
     imputer = SimpleImputer(strategy='median')
     X       = imputer.fit_transform(X)
 
-    # Recording-level split: entire recordings go to either train or test
-    splitter = GroupShuffleSplit(
-        n_splits=1, test_size=test_size, random_state=random_state)
-    train_idx, test_idx = next(splitter.split(X, y, groups=g))
+    # ------------------------------------------------------------------
+    # Stratified recording-level split
+    #
+    # For each class, collect the unique recording IDs, shuffle them, then
+    # take ceil(test_size * n_recordings) recordings as test. This mirrors
+    # what StratifiedShuffleSplit does at the sample level, but applied to
+    # recordings so that whole recordings are never split across train/test.
+    # ------------------------------------------------------------------
+    rng = np.random.default_rng(random_state)
 
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
+    # Map each recording ID to its class (every rep in a recording has the
+    # same label, so we just take the first occurrence)
+    rec_to_class = {}
+    for label, rec in zip(y, g):
+        if rec not in rec_to_class:
+            rec_to_class[rec] = label
+
+    # Group recording IDs by class
+    class_to_recs = defaultdict(list)
+    for rec, cls in rec_to_class.items():
+        class_to_recs[cls].append(rec)
+
+    test_recs = set()
+    for cls, recs in class_to_recs.items():
+        recs_shuffled = recs.copy()
+        rng.shuffle(recs_shuffled)
+        n_test = max(1, round(test_size * len(recs_shuffled)))
+        test_recs.update(recs_shuffled[:n_test])
+
+    test_mask  = np.array([gi in test_recs for gi in g])
+    train_mask = ~test_mask
+
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask], y[test_mask]
+    g_train, g_test = g[train_mask], g[test_mask]
 
     print(f"\nTrain: {len(X_train)} reps from "
-          f"{len(set(g[train_idx]))} recordings")
+          f"{len(set(g_train))} recordings")
     print(f"Test:  {len(X_test)} reps from "
-          f"{len(set(g[test_idx]))} recordings")
-    print(f"Train classes: {sorted(set(y_train))}")
-    print(f"Test  classes: {sorted(set(y_test))}")
+          f"{len(set(g_test))} recordings")
+
+    # Print per-class breakdown so stratification can be verified
+    from collections import Counter
+    train_counts = Counter(y_train)
+    test_counts  = Counter(y_test)
+    all_classes  = sorted(set(y))
+    col = max(len(c) for c in all_classes) + 2
+    print(f"\n  {'Class':<{col}}  {'Train':>6}  {'Test':>5}")
+    print(f"  {'-'*col}  {'------':>6}  {'-----':>5}")
+    for cls in all_classes:
+        print(f"  {cls:<{col}}  {train_counts.get(cls, 0):>6}  "
+              f"{test_counts.get(cls, 0):>5}")
 
     clf = RandomForestClassifier(
         n_estimators=n_estimators,

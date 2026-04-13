@@ -11,10 +11,15 @@ every axis subplot:
 Rep segmentation is performed on a single primary device (default: device 0,
 typically the wrist) using valley-to-valley boundaries. The minimum separation
 between valleys is estimated automatically from the autocorrelation of the
-filtered magnitude signal, so no exercise-specific tuning is required. A
-manual override (--min-separation) is available for edge cases. The first N
-reps (default: 5) are used as a good-form template. Every rep is scored
-against that template using DTW on the raw vector magnitude of each device
+low-pass filtered magnitude signal. A bandpass filter is then applied — with
+cutoffs derived adaptively from the ACF-estimated rep period — to further
+remove DC drift and high-frequency noise before valley detection. This keeps
+segmentation clean without discarding within-rep jitter that is useful for
+form analysis. The raw low-pass signal is retained for DTW scoring so that
+high-frequency deviations in form still contribute to anomaly scores. A manual
+override (--min-separation) is available for edge cases. The first N reps
+(default: 5) are used as a good-form template. Every rep is scored against
+that template using DTW on the raw vector magnitude of each device
 independently. Per-device scores are normalised to a common scale and then
 combined via a weighted sum (equal weights by default, overridable with
 --weights). Reps whose combined score exceeds the threshold are flagged as
@@ -198,6 +203,53 @@ def estimate_rep_period_acf(mag_f, fs,
     return period_s
 
 
+def bandpass_filter(mag, fs, period_s,
+                    lower_cycles=0.5, upper_cycles=2.5):
+    """
+    Apply an adaptive bandpass filter whose cutoffs are derived from the
+    estimated rep period, making the filter exercise-agnostic.
+
+    Cutoffs:
+      low  = lower_cycles / period_s  Hz  (default: 0.5 × rep frequency)
+              Removes DC offset and slow sensor drift while staying safely
+              below the rep fundamental.
+      high = upper_cycles / period_s  Hz  (default: 2.5 × rep frequency)
+              Preserves the fundamental and first two harmonics that define
+              the rep waveform shape, while cutting higher-frequency noise.
+
+    Both cutoffs are clamped to valid Butterworth ranges before filtering.
+
+    Parameters
+    ----------
+    mag          : 1-D raw or low-pass magnitude array
+    fs           : sampling rate in Hz
+    period_s     : estimated rep period in seconds (from ACF)
+    lower_cycles : low-cut expressed as a multiple of the rep frequency
+    upper_cycles : high-cut expressed as a multiple of the rep frequency
+
+    Returns
+    -------
+    mag_bp : bandpass-filtered magnitude array, same length as mag
+    low_hz : actual low cutoff used (Hz)
+    high_hz: actual high cutoff used (Hz)
+    """
+    nyq      = fs / 2.0
+    low_hz   = lower_cycles / period_s
+    high_hz  = upper_cycles / period_s
+
+    # Clamp to valid range: low must be > 0, high must be < nyquist
+    low_hz  = max(low_hz,  0.01)
+    high_hz = min(high_hz, nyq * 0.95)
+
+    if low_hz >= high_hz:
+        # Degenerate case (very low fs or very short period): skip bandpass
+        return mag.copy(), low_hz, high_hz
+
+    b, a   = butter(2, [low_hz / nyq, high_hz / nyq], btype='band')
+    mag_bp = filtfilt(b, a, mag)
+    return mag_bp, low_hz, high_hz
+
+
 # ---------------------------------------------------------------------------
 # Peak / valley detection
 # ---------------------------------------------------------------------------
@@ -211,24 +263,23 @@ def detect_peaks_valleys(times, xs, ys, zs,
 
     Steps:
       1. Compute vector magnitude: mag = sqrt(x^2 + y^2 + z^2)
-      2. Low-pass filter at `lowpass_hz` Hz to remove high-freq noise
-      3. If `min_separation_s` is None, estimate the rep period via
-         autocorrelation and use half that period as the minimum separation
-         (peaks and valleys of the same type recur once per full period,
-         so half the period is the tightest safe lower bound)
-      4. Run scipy find_peaks on the filtered magnitude with:
-           - minimum separation of `min_separation_s` seconds
+      2. Low-pass filter at `lowpass_hz` Hz  → mag_f  (retained for DTW)
+      3. Estimate rep period via ACF of mag_f (or use min_separation_s)
+      4. Bandpass filter with adaptive cutoffs from the rep period → mag_bp
+         (used for valley/peak detection only — cleaner baseline, less noise)
+      5. Run scipy find_peaks on mag_bp with:
+           - minimum separation of min_sep_used seconds
            - minimum prominence of `prominence_factor` x signal IQR
-      5. Run find_peaks on the inverted signal for valleys
+      6. Run find_peaks on the inverted mag_bp for valleys
 
     Parameters
     ----------
     times             : 1-D array of normalised time values (seconds)
     xs, ys, zs        : 1-D arrays of accelerometer axes
-    lowpass_hz        : low-pass filter cutoff frequency
+    lowpass_hz        : low-pass filter cutoff frequency (pre-bandpass stage)
     min_separation_s  : minimum seconds between same-type events. When None
                         (default) the value is derived automatically from the
-                        ACF of the filtered magnitude.
+                        ACF of mag_f.
     prominence_factor : IQR multiplier for the peak prominence threshold
 
     Returns
@@ -236,7 +287,10 @@ def detect_peaks_valleys(times, xs, ys, zs,
     peak_times   : 1-D array of times of peaks
     valley_times : 1-D array of times of valleys
     valley_idx   : 1-D array of sample indices of valleys (for segmentation)
-    mag_f        : filtered magnitude array (for DTW scoring)
+    mag_f        : low-pass filtered magnitude (for DTW scoring)
+    mag_bp       : bandpass filtered magnitude (for reference / plotting)
+    bp_low_hz    : actual bandpass low cutoff used (Hz)
+    bp_high_hz   : actual bandpass high cutoff used (Hz)
     min_sep_used : the min_separation_s value actually used (for logging)
     """
     dt = float(np.median(np.diff(times)))
@@ -244,36 +298,43 @@ def detect_peaks_valleys(times, xs, ys, zs,
 
     mag = np.sqrt(xs**2 + ys**2 + zs**2)
 
-    # Low-pass filter
+    # Stage 1: low-pass → used for ACF estimation and DTW scoring
     nyq    = fs / 2.0
-    cutoff = min(lowpass_hz, nyq * 0.9)   # guard against low-fs devices
+    cutoff = min(lowpass_hz, nyq * 0.9)
     b, a   = butter(2, cutoff / nyq, btype='low')
     mag_f  = filtfilt(b, a, mag)
 
-    # Derive minimum separation from ACF when not supplied
+    # Stage 2: estimate rep period from ACF of low-passed signal
     if min_separation_s is None:
         period_s     = estimate_rep_period_acf(mag_f, fs)
-        # Half the rep period: same-type events (valley→valley) are separated
-        # by one full period, so half is the tightest safe lower bound.
         min_sep_used = period_s / 2.0
     else:
+        # When min_separation_s is provided directly, back-derive a plausible
+        # period estimate for the bandpass cutoffs (2× the half-period)
+        period_s     = min_separation_s * 2.0
         min_sep_used = min_separation_s
+
+    # Stage 3: bandpass filter for valley/peak detection only
+    mag_bp, bp_low_hz, bp_high_hz = bandpass_filter(mag_f, fs, period_s)
 
     dist_samples = max(1, int(min_sep_used * fs))
 
-    # Use IQR-based prominence so outlier spikes do not inflate the threshold
-    iqr        = float(np.percentile(mag_f, 75) - np.percentile(mag_f, 25))
+    # IQR-based prominence on the bandpass signal
+    iqr        = float(np.percentile(mag_bp, 75) - np.percentile(mag_bp, 25))
     prominence = max(iqr * prominence_factor, 1e-6)
 
-    peak_idx,   _ = find_peaks( mag_f, distance=dist_samples,
+    peak_idx,   _ = find_peaks( mag_bp, distance=dist_samples,
                                  prominence=prominence)
-    valley_idx, _ = find_peaks(-mag_f, distance=dist_samples,
+    valley_idx, _ = find_peaks(-mag_bp, distance=dist_samples,
                                  prominence=prominence)
 
     return (np.array(times)[peak_idx],
             np.array(times)[valley_idx],
             valley_idx,
             mag_f,
+            mag_bp,
+            bp_low_hz,
+            bp_high_hz,
             min_sep_used)
 
 
@@ -498,8 +559,106 @@ def score_reps(segments, devices, templates, weights,
     return raw, combined, threshold, anomalous
 
 
+def plot_bandpass(devices, segments, anomalous, primary_label,
+                  save_path=None):
+    """
+    Diagnostic figure showing three filter layers for each device:
+      - Raw vector magnitude (light grey)
+      - Low-pass filtered magnitude (blue)
+      - Bandpass filtered magnitude (orange, used for segmentation)
+
+    Valley markers are drawn on the bandpass signal to show exactly what
+    the segmentation algorithm sees. Rep shading is also applied so you
+    can verify that valley boundaries align correctly with the movement.
+
+    One subplot per device, all sharing the same x-axis.
+
+    Parameters
+    ----------
+    devices      : list of ordered device dicts (must contain mag_f, mag_bp,
+                   times, xs, ys, zs, valley_times, bp_low_hz, bp_high_hz)
+    segments     : list of (start_idx, end_idx) rep boundary tuples
+    anomalous    : boolean array (n_reps,)
+    primary_label: label of the primary device (for title annotation)
+    save_path    : if given, save PNG here instead of displaying
+    """
+    n         = len(devices)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 4 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        "Bandpass filter diagnostic  —  "
+        "grey=raw mag · blue=low-pass · orange=bandpass (used for segmentation)",
+        fontsize=12, fontweight='bold')
+
+    primary_times = np.array(devices[0]['times'])
+
+    for ax, dev in zip(axes, devices):
+        times = np.array(dev['times'])
+        xs    = np.array(dev['xs'])
+        ys    = np.array(dev['ys'])
+        zs    = np.array(dev['zs'])
+        mag_raw = np.sqrt(xs**2 + ys**2 + zs**2)
+        mag_f   = np.array(dev['mag_f'])
+        mag_bp  = np.array(dev['mag_bp'])
+
+        # Rep shading
+        for rep_i, (s, e) in enumerate(segments):
+            t_s = primary_times[s]
+            t_e = primary_times[min(e, len(primary_times) - 1)]
+            color = '#e74c3c' if anomalous[rep_i] else '#2ecc71'
+            ax.axvspan(t_s, t_e, color=color, alpha=0.10, zorder=0)
+            ax.text((t_s + t_e) / 2, 1.0, str(rep_i + 1),
+                    transform=ax.get_xaxis_transform(),
+                    ha='center', va='bottom', fontsize=7, color='#555555')
+
+        # Three signal layers
+        ax.plot(times, mag_raw, color='#bdc3c7', linewidth=0.6,
+                alpha=0.8, label='Raw magnitude', zorder=1)
+        ax.plot(times, mag_f,   color='#2980b9', linewidth=0.9,
+                alpha=0.85, label='Low-pass', zorder=2)
+        ax.plot(times, mag_bp,  color='#e67e22', linewidth=1.1,
+                alpha=0.95, label='Bandpass (segmentation)', zorder=3)
+
+        # Valley markers on bandpass signal
+        valley_times = np.array(dev['valley_times'])
+        if len(valley_times) > 0:
+            valley_bp_vals = np.interp(valley_times, times, mag_bp)
+            y_span         = mag_raw.max() - mag_raw.min()
+            offset         = y_span * 0.06
+            ax.scatter(valley_times,
+                       valley_bp_vals - offset,
+                       marker='^', color='#c0392b', s=55, zorder=5,
+                       label=f'Valley ({len(valley_times)})')
+
+        primary_tag = '  \u2605 primary' if dev['label'] == primary_label else ''
+        ax.set_title(
+            f"{dev['label']}{primary_tag}   "
+            f"bandpass [{dev['bp_low_hz']:.2f} – {dev['bp_high_hz']:.2f}] Hz",
+            fontsize=11, loc='left')
+        ax.set_ylabel("Magnitude\n(native units)", fontsize=9)
+        ax.legend(loc='upper right', fontsize=9, ncol=4)
+        ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+        ax.grid(True, which='major', linestyle='--', alpha=0.5)
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25)
+
+    axes[-1].set_xlabel("Time (seconds from sync point)", fontsize=11)
+    axes[-1].xaxis.set_minor_locator(ticker.AutoMinorLocator())
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"  Saved bandpass plot: {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
-# Plotting
+# Main signal + anomaly plot
 # ---------------------------------------------------------------------------
 
 def plot_all(devices, segments, per_device_scores, combined_scores,
@@ -741,7 +900,12 @@ def main():
                              'Values are normalised to sum to 1 internally. '
                              'Default: equal weights across all devices.')
     parser.add_argument('--save-png', metavar='PATH',
-                        help='Save plot as PNG instead of displaying it')
+                        help='Save main plot as PNG instead of displaying it')
+    parser.add_argument('--save-bp-png', metavar='PATH',
+                        help='Save bandpass diagnostic plot as PNG. '
+                             'If omitted the plot is shown interactively '
+                             '(or skipped if --save-png is also omitted and '
+                             'you prefer not to see it).')
     args = parser.parse_args()
 
     labels = args.labels or [Path(f).stem for f in args.files]
@@ -804,7 +968,8 @@ def main():
         t0    = ts[0]
         times = ts - t0
 
-        peak_times, valley_times, valley_idx, mag_f, min_sep_used = \
+        peak_times, valley_times, valley_idx, mag_f, mag_bp, \
+            bp_low_hz, bp_high_hz, min_sep_used = \
             detect_peaks_valleys(
                 times, xs, ys, zs,
                 lowpass_hz=args.lowpass_hz,
@@ -816,6 +981,7 @@ def main():
         fs  = len(times) / dur if dur > 0 else 0
         print(f"  [{d['label']}] {len(times):,} samples (~{fs:.0f} Hz)  |  "
               f"min_sep={min_sep_used:.2f}s  |  "
+              f"bp=[{bp_low_hz:.2f},{bp_high_hz:.2f}] Hz  |  "
               f"{len(peak_times)} peaks, {len(valley_times)} valleys")
 
         devices.append({'label':        d['label'],
@@ -826,7 +992,10 @@ def main():
                         'peak_times':   peak_times,
                         'valley_times': valley_times,
                         'valley_idx':   valley_idx,
-                        'mag_f':        mag_f})
+                        'mag_f':        mag_f,
+                        'mag_bp':       mag_bp,
+                        'bp_low_hz':    bp_low_hz,
+                        'bp_high_hz':   bp_high_hz})
 
     # ------------------------------------------------------------------
     # Rep segmentation on primary device
@@ -905,7 +1074,14 @@ def main():
               f"{device_cols}{flag}")
 
     # ------------------------------------------------------------------
-    # Plot
+    # Bandpass diagnostic plot
+    # ------------------------------------------------------------------
+    plot_bandpass(ordered_devices, segments, anomalous,
+                  primary_label=p_label,
+                  save_path=args.save_bp_png)
+
+    # ------------------------------------------------------------------
+    # Main signal + anomaly plot
     # ------------------------------------------------------------------
     plot_all(ordered_devices, segments,
              per_device_scores, combined_scores,
