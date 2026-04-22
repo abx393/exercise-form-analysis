@@ -11,10 +11,15 @@ every axis subplot:
 Rep segmentation is performed on a single primary device (default: device 0,
 typically the wrist) using valley-to-valley boundaries. The minimum separation
 between valleys is estimated automatically from the autocorrelation of the
-filtered magnitude signal, so no exercise-specific tuning is required. A
-manual override (--min-separation) is available for edge cases. The first N
-reps (default: 5) are used as a good-form template. Every rep is scored
-against that template using DTW on the raw vector magnitude of each device
+low-pass filtered magnitude signal. A bandpass filter is then applied — with
+cutoffs derived adaptively from the ACF-estimated rep period — to further
+remove DC drift and high-frequency noise before valley detection. This keeps
+segmentation clean without discarding within-rep jitter that is useful for
+form analysis. The raw low-pass signal is retained for DTW scoring so that
+high-frequency deviations in form still contribute to anomaly scores. A manual
+override (--min-separation) is available for edge cases. The first N reps
+(default: 5) are used as a good-form template. Every rep is scored against
+that template using DTW on the raw vector magnitude of each device
 independently. Per-device scores are normalised to a common scale and then
 combined via a weighted sum (equal weights by default, overridable with
 --weights). Reps whose combined score exceeds the threshold are flagged as
@@ -39,285 +44,41 @@ Usage:
         --save-png output.png
 """
 
-import csv
 import argparse
 import datetime
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import find_peaks, butter, filtfilt
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-# Garmin epoch offset (seconds between 1989-12-31 and 1970-01-01)
-GARMIN_EPOCH_OFFSET = 631065600
+from signal_utils import (
+    detect_and_convert_timestamps,
+    load_signal_csv,
+    load_recording,
+    compute_sync_window,
+    trim_to_window,
+    estimate_rep_period_acf,
+    bandpass_filter,
+    detect_peaks_valleys,
+    segment_reps,
+)
 
 
 # ---------------------------------------------------------------------------
-# Timestamp detection
-# ---------------------------------------------------------------------------
-
-def detect_and_convert_timestamps(raw_timestamps):
-    """
-    Detect timestamp units/epoch and return as Unix epoch seconds (float).
-
-    Detection order:
-      1. ~1e18 → nanoseconds  (divide by 1e9)
-      2. ~1e12 → milliseconds (divide by 1e3)
-      3. ~1e9  → seconds; if resulting date is before 2010 assume Garmin epoch
-    """
-    sample = raw_timestamps[len(raw_timestamps) // 2]
-
-    if sample >= 1e15:
-        converted = [t / 1e9 for t in raw_timestamps]
-        unit = "nanoseconds"
-    elif sample >= 1e11:
-        converted = [t / 1e3 for t in raw_timestamps]
-        unit = "milliseconds"
-    else:
-        converted = list(raw_timestamps)
-        unit = "seconds (Unix)"
-        # Secondary check: if midpoint is before 2010, it's Garmin epoch
-        if converted[len(converted) // 2] < 1262304000:  # 2010-01-01
-            converted = [t + GARMIN_EPOCH_OFFSET for t in raw_timestamps]
-            unit = "seconds (Garmin epoch → Unix)"
-
-    mid = converted[len(converted) // 2]
-    dt  = datetime.datetime.fromtimestamp(mid, tz=datetime.timezone.utc)
-    print(f"    Unit detected: {unit}")
-    print(f"    Midpoint time: {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    return converted
-
-
-# ---------------------------------------------------------------------------
-# CSV loading
+# CSV loading  (simple path: files already have absolute_timestamp + accel_x/y/z)
 # ---------------------------------------------------------------------------
 
 def load_device_csv(filepath):
     """
-    Load a clean accelerometer CSV.
-    Returns timestamps (Unix epoch seconds) and xs, ys, zs arrays,
-    sorted by timestamp.
+    Load a pre-converted accelerometer CSV with absolute_timestamp, accel_x/y/z.
+    Returns (timestamps_unix_s, xs, ys, zs) sorted by timestamp.
+    Falls back to load_signal_csv from signal_utils for other formats.
     """
-    raw_ts, xs, ys, zs = [], [], [], []
-
-    with open(filepath, newline='', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw_ts.append(float(row['absolute_timestamp']))
-            xs.append(float(row['accel_x']))
-            ys.append(float(row['accel_y']))
-            zs.append(float(row['accel_z']))
-
-    if not raw_ts:
-        raise ValueError(f"No data rows found in {filepath}")
-
-    timestamps = detect_and_convert_timestamps(raw_ts)
-
-    # Sort by timestamp (some devices write out-of-order)
-    order      = sorted(range(len(timestamps)), key=lambda i: timestamps[i])
-    timestamps = [timestamps[i] for i in order]
-    xs         = [xs[i] for i in order]
-    ys         = [ys[i] for i in order]
-    zs         = [zs[i] for i in order]
-
-    return (np.array(timestamps), np.array(xs),
-            np.array(ys),         np.array(zs))
-
-
-def trim_to_window(timestamps, xs, ys, zs, t_start, t_end):
-    """Keep only samples within [t_start, t_end]."""
-    mask = (timestamps >= t_start) & (timestamps <= t_end)
-    return timestamps[mask], xs[mask], ys[mask], zs[mask]
-
-
-# ---------------------------------------------------------------------------
-# Autocorrelation-based rep period estimation
-# ---------------------------------------------------------------------------
-
-def estimate_rep_period_acf(mag_f, fs,
-                             min_period_s=0.3,
-                             max_period_s=10.0):
-    """
-    Estimate the dominant rep period from the autocorrelation of the filtered
-    magnitude signal.
-
-    The full-signal ACF is computed, then the first peak beyond
-    `min_period_s` is found. That lag is the estimated rep period. Searching
-    beyond a minimum lag prevents the zero-lag trivial peak and any harmonics
-    at very short lags from being picked up.
-
-    Parameters
-    ----------
-    mag_f        : 1-D array, filtered magnitude signal
-    fs           : sampling rate in Hz
-    min_period_s : shortest plausible rep duration in seconds (default 0.3 s).
-                   Prevents the zero-lag peak and sub-rep harmonics from being
-                   selected. 0.3 s is intentionally very short so the function
-                   works for fast exercises like jumping jacks.
-    max_period_s : longest plausible rep duration in seconds (default 10 s).
-                   Acts as a safety cap for very slow exercises or noisy signals.
-
-    Returns
-    -------
-    period_s : float, estimated rep period in seconds.
-               Falls back to max_period_s / 2 if no clear peak is found.
-    """
-    # Mean-centre before computing ACF so DC offset doesn't dominate
-    x     = mag_f - mag_f.mean()
-    n     = len(x)
-    # Full normalised ACF via FFT (O(n log n) rather than O(n²))
-    fft_x = np.fft.rfft(x, n=2 * n)
-    acf   = np.fft.irfft(fft_x * np.conj(fft_x))[:n]
-    acf   = acf / (acf[0] + 1e-12)   # normalise to 1 at lag 0
-
-    min_lag = max(1, int(min_period_s * fs))
-    max_lag = min(n - 1, int(max_period_s * fs))
-
-    if min_lag >= max_lag:
-        fallback = max_period_s / 2.0
-        print(f"    ACF: search range empty, falling back to {fallback:.2f} s")
-        return fallback
-
-    search_region = acf[min_lag:max_lag]
-    peaks, props  = find_peaks(search_region, prominence=0.05)
-
-    if len(peaks) == 0:
-        # No clear periodicity found; use a conservative fallback
-        fallback = max_period_s / 2.0
-        print(f"    ACF: no dominant peak found, falling back to {fallback:.2f} s")
-        return fallback
-
-    # Pick the highest-prominence peak (most clearly periodic)
-    best      = peaks[np.argmax(props['prominences'])]
-    lag_idx   = best + min_lag          # index back into the full ACF
-    period_s  = lag_idx / fs
-    print(f"    ACF: estimated rep period = {period_s:.2f} s  "
-          f"(ACF peak at lag {lag_idx}, prominence "
-          f"{props['prominences'][np.argmax(props['prominences'])]:.3f})")
-    return period_s
-
-
-# ---------------------------------------------------------------------------
-# Peak / valley detection
-# ---------------------------------------------------------------------------
-
-def detect_peaks_valleys(times, xs, ys, zs,
-                          lowpass_hz=5.0,
-                          min_separation_s=None,
-                          prominence_factor=0.5):
-    """
-    Detect peaks and valleys in the vector magnitude signal.
-
-    Steps:
-      1. Compute vector magnitude: mag = sqrt(x^2 + y^2 + z^2)
-      2. Low-pass filter at `lowpass_hz` Hz to remove high-freq noise
-      3. If `min_separation_s` is None, estimate the rep period via
-         autocorrelation and use half that period as the minimum separation
-         (peaks and valleys of the same type recur once per full period,
-         so half the period is the tightest safe lower bound)
-      4. Run scipy find_peaks on the filtered magnitude with:
-           - minimum separation of `min_separation_s` seconds
-           - minimum prominence of `prominence_factor` x signal IQR
-      5. Run find_peaks on the inverted signal for valleys
-
-    Parameters
-    ----------
-    times             : 1-D array of normalised time values (seconds)
-    xs, ys, zs        : 1-D arrays of accelerometer axes
-    lowpass_hz        : low-pass filter cutoff frequency
-    min_separation_s  : minimum seconds between same-type events. When None
-                        (default) the value is derived automatically from the
-                        ACF of the filtered magnitude.
-    prominence_factor : IQR multiplier for the peak prominence threshold
-
-    Returns
-    -------
-    peak_times   : 1-D array of times of peaks
-    valley_times : 1-D array of times of valleys
-    valley_idx   : 1-D array of sample indices of valleys (for segmentation)
-    mag_f        : filtered magnitude array (for DTW scoring)
-    min_sep_used : the min_separation_s value actually used (for logging)
-    """
-    dt = float(np.median(np.diff(times)))
-    fs = 1.0 / dt if dt > 0 else 100.0
-
-    mag = np.sqrt(xs**2 + ys**2 + zs**2)
-
-    # Low-pass filter
-    nyq    = fs / 2.0
-    cutoff = min(lowpass_hz, nyq * 0.9)   # guard against low-fs devices
-    b, a   = butter(2, cutoff / nyq, btype='low')
-    mag_f  = filtfilt(b, a, mag)
-
-    # Derive minimum separation from ACF when not supplied
-    if min_separation_s is None:
-        period_s     = estimate_rep_period_acf(mag_f, fs)
-        # Half the rep period: same-type events (valley→valley) are separated
-        # by one full period, so half is the tightest safe lower bound.
-        min_sep_used = period_s / 2.0
-    else:
-        min_sep_used = min_separation_s
-
-    dist_samples = max(1, int(min_sep_used * fs))
-
-    # Use IQR-based prominence so outlier spikes do not inflate the threshold
-    iqr        = float(np.percentile(mag_f, 75) - np.percentile(mag_f, 25))
-    prominence = max(iqr * prominence_factor, 1e-6)
-
-    peak_idx,   _ = find_peaks( mag_f, distance=dist_samples,
-                                 prominence=prominence)
-    valley_idx, _ = find_peaks(-mag_f, distance=dist_samples,
-                                 prominence=prominence)
-
-    return (np.array(times)[peak_idx],
-            np.array(times)[valley_idx],
-            valley_idx,
-            mag_f,
-            min_sep_used)
-
-
-# ---------------------------------------------------------------------------
-# Rep segmentation
-# ---------------------------------------------------------------------------
-
-def segment_reps(valley_idx, n_samples, min_dur_factor=0.5, n_template=5):
-    """
-    Slice the signal into valley-to-valley rep segments.
-
-    Uses the first `n_template` inter-valley durations to estimate a typical
-    rep length, then rejects any segment shorter than `min_dur_factor` × that
-    median duration. This guards against spurious extra valleys (e.g. a wobble
-    mid-rep) splitting a single rep into two short fragments.
-
-    Parameters
-    ----------
-    valley_idx      : array of sample indices of detected valleys
-    n_samples       : total number of samples in the signal
-    min_dur_factor  : minimum rep length as a fraction of median rep length
-    n_template      : how many early reps to use for the duration estimate
-
-    Returns
-    -------
-    segments : list of (start_idx, end_idx) tuples, one per rep.
-               The slice signal[start_idx:end_idx] covers one rep.
-    """
-    if len(valley_idx) < 2:
-        return []
-
-    # Estimate typical rep duration from the first n_template inter-valley gaps
-    early_durs = np.diff(valley_idx[:n_template + 1])
-    median_dur = float(np.median(early_durs))
-    min_dur    = max(1, int(median_dur * min_dur_factor))
-
-    segments = []
-    for i in range(len(valley_idx) - 1):
-        start = int(valley_idx[i])
-        end   = int(valley_idx[i + 1])
-        if (end - start) >= min_dur:
-            segments.append((start, end))
-
-    return segments
+    result = load_signal_csv(filepath, sensor='accel')
+    if result is None:
+        raise ValueError(f"Could not load accelerometer data from {filepath}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -477,10 +238,11 @@ def score_reps(segments, devices, templates, weights,
     # own cross-rep distribution, not by their raw amplitude units.
     normed = np.zeros_like(raw)
     for d_i in range(n_devices):
-        mu    = float(np.mean(raw[d_i]))
+        #mu    = float(np.mean(raw[d_i]))
         sigma = float(np.std(raw[d_i]))
         sigma = max(sigma, 1e-6)
-        normed[d_i] = (raw[d_i] - mu) / sigma
+        #normed[d_i] = (raw[d_i] - mu) / sigma
+        normed[d_i] = raw[d_i] / sigma
 
     # --- Weighted sum across devices ---
     w = np.array(weights, dtype=float)
@@ -498,8 +260,106 @@ def score_reps(segments, devices, templates, weights,
     return raw, combined, threshold, anomalous
 
 
+def plot_bandpass(devices, segments, anomalous, primary_label,
+                  save_path=None):
+    """
+    Diagnostic figure showing three filter layers for each device:
+      - Raw vector magnitude (light grey)
+      - Low-pass filtered magnitude (blue)
+      - Bandpass filtered magnitude (orange, used for segmentation)
+
+    Valley markers are drawn on the bandpass signal to show exactly what
+    the segmentation algorithm sees. Rep shading is also applied so you
+    can verify that valley boundaries align correctly with the movement.
+
+    One subplot per device, all sharing the same x-axis.
+
+    Parameters
+    ----------
+    devices      : list of ordered device dicts (must contain mag_f, mag_bp,
+                   times, xs, ys, zs, valley_times, bp_low_hz, bp_high_hz)
+    segments     : list of (start_idx, end_idx) rep boundary tuples
+    anomalous    : boolean array (n_reps,)
+    primary_label: label of the primary device (for title annotation)
+    save_path    : if given, save PNG here instead of displaying
+    """
+    n         = len(devices)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 4 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        "Bandpass filter diagnostic  —  "
+        "grey=raw mag · blue=low-pass · orange=bandpass (used for segmentation)",
+        fontsize=12, fontweight='bold')
+
+    primary_times = np.array(devices[0]['times'])
+
+    for ax, dev in zip(axes, devices):
+        times = np.array(dev['times'])
+        xs    = np.array(dev['xs'])
+        ys    = np.array(dev['ys'])
+        zs    = np.array(dev['zs'])
+        mag_raw = np.sqrt(xs**2 + ys**2 + zs**2)
+        mag_f   = np.array(dev['mag_f'])
+        mag_bp  = np.array(dev['mag_bp'])
+
+        # Rep shading
+        for rep_i, (s, e) in enumerate(segments):
+            t_s = primary_times[s]
+            t_e = primary_times[min(e, len(primary_times) - 1)]
+            color = '#e74c3c' if anomalous[rep_i] else '#2ecc71'
+            ax.axvspan(t_s, t_e, color=color, alpha=0.10, zorder=0)
+            ax.text((t_s + t_e) / 2, 1.0, str(rep_i + 1),
+                    transform=ax.get_xaxis_transform(),
+                    ha='center', va='bottom', fontsize=7, color='#555555')
+
+        # Three signal layers
+        ax.plot(times, mag_raw, color='#bdc3c7', linewidth=0.6,
+                alpha=0.8, label='Raw magnitude', zorder=1)
+        ax.plot(times, mag_f,   color='#2980b9', linewidth=0.9,
+                alpha=0.85, label='Low-pass', zorder=2)
+        ax.plot(times, mag_bp,  color='#e67e22', linewidth=1.1,
+                alpha=0.95, label='Bandpass (segmentation)', zorder=3)
+
+        # Valley markers on bandpass signal
+        valley_times = np.array(dev['valley_times'])
+        if len(valley_times) > 0:
+            valley_bp_vals = np.interp(valley_times, times, mag_bp)
+            y_span         = mag_raw.max() - mag_raw.min()
+            offset         = y_span * 0.06
+            ax.scatter(valley_times,
+                       valley_bp_vals - offset,
+                       marker='^', color='#c0392b', s=55, zorder=5,
+                       label=f'Valley ({len(valley_times)})')
+
+        primary_tag = '  \u2605 primary' if dev['label'] == primary_label else ''
+        ax.set_title(
+            f"{dev['label']}{primary_tag}   "
+            f"bandpass [{dev['bp_low_hz']:.2f} – {dev['bp_high_hz']:.2f}] Hz",
+            fontsize=11, loc='left')
+        ax.set_ylabel("Magnitude\n(native units)", fontsize=9)
+        ax.legend(loc='upper right', fontsize=9, ncol=4)
+        ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+        ax.grid(True, which='major', linestyle='--', alpha=0.5)
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25)
+
+    axes[-1].set_xlabel("Time (seconds from sync point)", fontsize=11)
+    axes[-1].xaxis.set_minor_locator(ticker.AutoMinorLocator())
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"  Saved bandpass plot: {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
-# Plotting
+# Main signal + anomaly plot
 # ---------------------------------------------------------------------------
 
 def plot_all(devices, segments, per_device_scores, combined_scores,
@@ -643,12 +503,14 @@ def plot_all(devices, segments, per_device_scores, combined_scores,
         mu    = float(np.mean(per_device_scores[d_i]))
         sigma = float(np.std(per_device_scores[d_i]))
         sigma = max(sigma, 1e-6)
-        normed[d_i] = (per_device_scores[d_i] - mu) / sigma
+        #normed[d_i] = (per_device_scores[d_i] - mu) / sigma
+        normed[d_i] = per_device_scores[d_i] / sigma
 
     weighted = normed * w[:, np.newaxis]   # (n_devices, n_reps)
 
     # Shift so the minimum combined value sits at y=0
-    shift     = combined_scores.min()
+    #shift     = combined_scores.min()
+    shift = 0
     threshold_shifted = threshold - shift
 
     bottoms = np.zeros(n_reps)
@@ -740,8 +602,17 @@ def main():
                              '(one value per file, e.g. --weights 0.5 0.3 0.2). '
                              'Values are normalised to sum to 1 internally. '
                              'Default: equal weights across all devices.')
+    parser.add_argument('--trim-margin', type=float, default=2.0,
+                        help='Seconds to trim from each end of the sync '
+                             'window to remove startup/shutdown noise '
+                             '(default: 2.0)')
     parser.add_argument('--save-png', metavar='PATH',
-                        help='Save plot as PNG instead of displaying it')
+                        help='Save main plot as PNG instead of displaying it')
+    parser.add_argument('--save-bp-png', metavar='PATH',
+                        help='Save bandpass diagnostic plot as PNG. '
+                             'If omitted the plot is shown interactively '
+                             '(or skipped if --save-png is also omitted and '
+                             'you prefer not to see it).')
     args = parser.parse_args()
 
     labels = args.labels or [Path(f).stem for f in args.files]
@@ -778,17 +649,11 @@ def main():
                          'ts': ts, 'xs': xs, 'ys': ys, 'zs': zs})
 
     # ------------------------------------------------------------------
-    # Find overlapping window: latest start → earliest end
+    # Find overlapping window with trim margin
     # ------------------------------------------------------------------
-    t_start = max(d['ts'][0]  for d in all_data) + 2
-    t_end   = min(d['ts'][-1] for d in all_data) - 2
-
-    if t_start >= t_end:
-        raise ValueError(
-            f"No overlapping time window found.\n"
-            f"  Latest start:  {t_start:.3f}\n"
-            f"  Earliest end:  {t_end:.3f}"
-        )
+    all_signals = {d['label']: {'ts': d['ts']} for d in all_data}
+    t_start, t_end = compute_sync_window(all_signals,
+                                          trim_margin_s=args.trim_margin)
 
     dt_start = datetime.datetime.fromtimestamp(t_start, tz=datetime.timezone.utc)
     print(f"\nSync window: {t_end - t_start:.2f} s  "
@@ -804,7 +669,8 @@ def main():
         t0    = ts[0]
         times = ts - t0
 
-        peak_times, valley_times, valley_idx, mag_f, min_sep_used = \
+        peak_times, valley_times, valley_idx, mag_f, mag_bp, \
+            bp_low_hz, bp_high_hz, min_sep_used = \
             detect_peaks_valleys(
                 times, xs, ys, zs,
                 lowpass_hz=args.lowpass_hz,
@@ -816,6 +682,7 @@ def main():
         fs  = len(times) / dur if dur > 0 else 0
         print(f"  [{d['label']}] {len(times):,} samples (~{fs:.0f} Hz)  |  "
               f"min_sep={min_sep_used:.2f}s  |  "
+              f"bp=[{bp_low_hz:.2f},{bp_high_hz:.2f}] Hz  |  "
               f"{len(peak_times)} peaks, {len(valley_times)} valleys")
 
         devices.append({'label':        d['label'],
@@ -826,7 +693,10 @@ def main():
                         'peak_times':   peak_times,
                         'valley_times': valley_times,
                         'valley_idx':   valley_idx,
-                        'mag_f':        mag_f})
+                        'mag_f':        mag_f,
+                        'mag_bp':       mag_bp,
+                        'bp_low_hz':    bp_low_hz,
+                        'bp_high_hz':   bp_high_hz})
 
     # ------------------------------------------------------------------
     # Rep segmentation on primary device
@@ -891,6 +761,8 @@ def main():
         threshold_sigma=args.anomaly_threshold,
     )
 
+    tp, fp, tn, fn = 0, 0, 0, 0
+
     print(f"  Anomaly threshold (combined): {threshold:.4f}")
     header = "  Rep  |  Combined  |  " + "  ".join(
         f"{d['label']:>10}" for d in ordered_devices)
@@ -901,11 +773,30 @@ def main():
             f"{per_device_scores[d_i, i]:>10.4f}"
             for d_i in range(len(ordered_devices)))
         flag = "  <- ANOMALOUS" if anomalous[i] else ""
+        if i >= 10:
+            if anomalous[i]:
+                tp += 1
+            else:
+                fn += 1
+        else:
+            if anomalous[i]:
+                fp += 1
+            else:
+                tn += 1
+
         print(f"  {i+1:3d}  |  {combined_scores[i]:8.4f}  |  "
               f"{device_cols}{flag}")
+    print('TP', tp, 'FP', fp, 'TN', tn, 'FN', fn)
 
     # ------------------------------------------------------------------
-    # Plot
+    # Bandpass diagnostic plot
+    # ------------------------------------------------------------------
+    plot_bandpass(ordered_devices, segments, anomalous,
+                  primary_label=p_label,
+                  save_path=args.save_bp_png)
+
+    # ------------------------------------------------------------------
+    # Main signal + anomaly plot
     # ------------------------------------------------------------------
     plot_all(ordered_devices, segments,
              per_device_scores, combined_scores,
