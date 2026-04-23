@@ -783,7 +783,7 @@ def main():
     parser.add_argument('--data-dir', metavar='PATH', default=None,
                         help='Root data directory for batch processing. '
                              'Structure: <exercise>/<subject>/<recording_id>/')
-    parser.add_argument('--primary-device', default='watch',
+    parser.add_argument('--primary-device', default='headphones',
                         choices=['watch', 'headphones', 'phone'],
                         help='Primary segmentation device for directory mode '
                              '(default: watch)')
