@@ -16,20 +16,24 @@ FIXED_PERSON_REP_COUNTS = {
 
 def infer_expected(person: str, session: str) -> int | None:
     if person in FIXED_PERSON_REP_COUNTS:
+
+        print('FIXED GT ', FIXED_PERSON_REP_COUNTS[person])
         return FIXED_PERSON_REP_COUNTS[person]
 
     match = re.search(r"(?i)(?<!\d)(\d+)x(\d+)(?!\d)", session)
+    print('session', session)
     if match:
         sets, reps = map(int, match.groups())
         if 1 <= sets <= 10 and 1 <= reps <= 40:
+            #print('GT sets x reps', sets * reps)
             return sets * reps
 
     match = re.search(r"(?i)(?<!\d)(\d+)x(?:_|-|$)", session)
     if match:
         reps = int(match.group(1))
         if 1 <= reps <= 40:
+            #print('GT reps', reps)
             return reps
-
     return None
 
 
@@ -53,7 +57,9 @@ def main() -> None:
             if expected is None:
                 continue
             estimated = int(row["estimated_total_reps"])
+            print('estimated', estimated)
             abs_error = abs(estimated - expected)
+            print('abs_error', abs_error)
             errs[str(row["exercise"])].append(abs_error)
             all_errors.append(abs_error)
 
