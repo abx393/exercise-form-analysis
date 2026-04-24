@@ -74,6 +74,8 @@ from signal_utils import (
     segment_reps,
     load_rep_boundaries,
     match_recording_to_boundaries,
+    load_eval_sessions,
+    match_recording_to_eval_set,
 )
 
 
@@ -878,6 +880,11 @@ def main():
                              'Example: --eval-subjects alice bob')
 
     # Shared args
+    parser.add_argument('--eval-sessions', metavar='CSV', default=None,
+                        help='CSV file listing the subset of recordings to '
+                             'evaluate on (must contain a relative_path column). '
+                             'Recordings not in this list are skipped during '
+                             'evaluation. Has no effect on training.')
     parser.add_argument('--rep-boundaries', metavar='CSV', default=None,
                         help='CSV file of pre-computed rep boundaries. When '
                              'provided, ACF-based segmentation is skipped and '
@@ -936,6 +943,13 @@ def main():
         boundaries_db = load_rep_boundaries(args.rep_boundaries)
         print(f"Loaded rep boundaries for {len(boundaries_db)} recording(s) "
               f"from {args.rep_boundaries}")
+
+    # Load eval session filter if provided
+    eval_set = None
+    if args.eval_sessions:
+        eval_set = load_eval_sessions(args.eval_sessions)
+        print(f"Loaded eval session filter: {len(eval_set)} recording(s) "
+              f"from {args.eval_sessions}")
 
     # ------------------------------------------------------------------
     # FILE MODE
@@ -1036,6 +1050,13 @@ def main():
                 for rec_dir in sorted(p for p in subj_dir.iterdir()
                                       if p.is_dir()):
                     rec_id = f"{exercise}/{subject}/{rec_dir.name}"
+
+                    # Filter to eval sessions if --eval-sessions given
+                    if eval_set is not None and not match_recording_to_eval_set(
+                            rec_dir, eval_set):
+                        print(f"  [skip eval] {rec_id}")
+                        continue
+
                     print(f"\n{'='*60}")
                     print(f"Recording: {rec_id}")
                     print(f"{'='*60}")

@@ -388,6 +388,50 @@ def load_rep_boundaries(csv_path):
     return result
 
 
+def load_eval_sessions(csv_path):
+    """
+    Load the set of recordings to evaluate on from a CSV file.
+
+    The CSV must contain a `relative_path` column with values in the format
+    'exercise/person/session' (backslash or forward slash separators accepted).
+    All other columns are ignored.
+
+    Returns
+    -------
+    set of (exercise, person, session) tuples — the recordings that should
+    be included in evaluation. Any recording not in this set should be
+    skipped during scoring (but may still be used for training).
+    """
+    import csv as _csv
+
+    eval_set = set()
+    with open(csv_path, newline='', encoding='utf-8-sig') as f:
+        reader = _csv.DictReader(f)
+        for row in reader:
+            raw_path = row['relative_path'].replace('\\', '/')
+            parts    = [p for p in raw_path.split('/') if p]
+            if len(parts) >= 3:
+                eval_set.add(tuple(parts[-3:]))
+
+    return eval_set
+
+
+def match_recording_to_eval_set(rec_dir, eval_set):
+    """
+    Return True if the recording directory's last three path components
+    match any entry in eval_set.
+
+    Parameters
+    ----------
+    rec_dir  : path-like recording directory
+    eval_set : set of (exercise, person, session) tuples from load_eval_sessions
+    """
+    parts = [p for p in Path(rec_dir).parts if p]
+    if len(parts) < 3:
+        return False
+    return tuple(parts[-3:]) in eval_set
+
+
 def match_recording_to_boundaries(rec_dir, boundaries):
     """
     Find the boundary list for a recording directory by matching the last

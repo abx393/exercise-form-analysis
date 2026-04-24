@@ -79,6 +79,8 @@ from signal_utils import (
     segment_reps,
     load_rep_boundaries,
     match_recording_to_boundaries,
+    load_eval_sessions,
+    match_recording_to_eval_set,
 )
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -515,12 +517,20 @@ def run_loso(data: dict,
              batch_size: int,
              n_good: int,
              threshold_sigma: float,
-             device: torch.device) -> dict:
+             device: torch.device,
+             eval_set: set | None = None) -> dict:
     """
     Run leave-one-subject-out CV for every exercise independently.
 
-    Returns
-    -------
+    Training always uses all good-form reps from non-held-out subjects.
+    Evaluation (scoring) is limited to recordings in eval_set when provided.
+
+    Parameters
+    ----------
+    eval_set : set of (exercise, person, session) tuples from
+               load_eval_sessions(), or None to evaluate all recordings.
+               Does NOT affect which recordings contribute training data.
+    
     results : dict keyed by exercise → list of fold dicts, each with:
         'subject'    : held-out subject name
         'y_true'     : (N,) int array  (0=good, 1=bad)
@@ -569,12 +579,28 @@ def run_loso(data: dict,
                 train_arr, rep_length, latent_dim,
                 epochs, lr, batch_size, device)
 
-            # ---- Encode all reps from held-out subject ----
+            # ---- Encode reps from held-out subject (eval filter applied) ----
             all_reps, all_is_good, all_rec_ids = [], [], []
+            skipped_eval = 0
             for rec in subject_data[held_out]:
+                # Apply eval session filter: skip recordings not in eval_set.
+                # Training is unaffected — only scoring is filtered.
+                if eval_set is not None:
+                    rec_path = Path(rec['rec_id'])
+                    if not match_recording_to_eval_set(rec_path, eval_set):
+                        skipped_eval += 1
+                        continue
                 all_reps.append(rec['reps'])
                 all_is_good.append(rec['is_good'])
                 all_rec_ids.extend([rec['rec_id']] * rec['n_reps'])
+
+            if skipped_eval:
+                print(f"    Skipped {skipped_eval} recording(s) "
+                      f"not in eval session filter")
+
+            if not all_reps:
+                print("    [skip] no evaluable recordings for this subject")
+                continue
 
             all_reps    = np.concatenate(all_reps, axis=0)
             all_is_good = np.concatenate(all_is_good, axis=0)
@@ -846,6 +872,12 @@ def main():
                         help='Seconds to trim from each end of the sync '
                              'window to remove startup/shutdown noise '
                              '(default: 2.0)')
+    parser.add_argument('--eval-sessions', metavar='CSV', default=None,
+                        help='CSV file listing the subset of recordings to '
+                             'evaluate on (must contain a relative_path column). '
+                             'Recordings not in this list are excluded from '
+                             'scoring but still contribute to autoencoder '
+                             'training if they contain good-form reps.')
     parser.add_argument('--rep-boundaries', metavar='CSV', default=None,
                         help='CSV file of pre-computed rep boundaries. When '
                              'provided, ACF-based segmentation is skipped. '
@@ -872,6 +904,13 @@ def main():
         boundaries_db = load_rep_boundaries(args.rep_boundaries)
         print(f"Loaded rep boundaries for {len(boundaries_db)} recording(s) "
               f"from {args.rep_boundaries}")
+
+    # Load eval session filter if provided
+    eval_set = None
+    if args.eval_sessions:
+        eval_set = load_eval_sessions(args.eval_sessions)
+        print(f"Loaded eval session filter: {len(eval_set)} recording(s) "
+              f"from {args.eval_sessions}")
 
     # ------------------------------------------------------------------
     # Load and process all recordings
@@ -919,6 +958,7 @@ def main():
         n_good          = args.n_good,
         threshold_sigma = args.threshold_sigma,
         device          = device,
+        eval_set        = eval_set,
     )
 
     if not results:
