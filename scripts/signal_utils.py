@@ -331,6 +331,85 @@ def load_recording(recording_dir):
 
 
 # ---------------------------------------------------------------------------
+# External rep boundary loading
+# ---------------------------------------------------------------------------
+
+def load_rep_boundaries(csv_path):
+    """
+    Load pre-computed rep boundaries from a CSV file produced by an external
+    segmentation script.
+
+    Expected columns (others are ignored):
+        relative_path  – recording path, e.g. "exercise\\person\\session"
+                         (backslash or forward slash separators both accepted)
+        rep_index      – 1-based integer rep number within the recording
+        start_s        – rep start time in seconds from the trimmed window start
+        end_s          – rep end time in seconds from the trimmed window start
+
+    The relative_path is normalised to a (exercise, person, session) tuple
+    by splitting on both backslash and forward slash and taking the last
+    three components. This makes matching robust to OS path differences.
+
+    Returns
+    -------
+    dict keyed by (exercise, person, session) tuple →
+         sorted list of (start_s, end_s) float pairs, one per rep in order.
+    """
+    import csv as _csv
+    from collections import defaultdict
+
+    boundaries = defaultdict(list)
+
+    with open(csv_path, newline='', encoding='utf-8-sig') as f:
+        reader = _csv.DictReader(f)
+        for row in reader:
+            # Normalise path: split on both separators, take last 3 parts
+            raw_path = row['relative_path'].replace('\\', '/')
+            parts    = [p for p in raw_path.split('/') if p]
+            if len(parts) < 3:
+                continue
+            key = tuple(parts[-3:])   # (exercise, person, session)
+
+            try:
+                rep_idx = int(row['rep_index'])
+                start_s = float(row['start_s'])
+                end_s   = float(row['end_s'])
+            except (ValueError, KeyError):
+                continue
+
+            boundaries[key].append((rep_idx, start_s, end_s))
+
+    # Sort each recording's reps by rep_index and strip the index
+    result = {}
+    for key, reps in boundaries.items():
+        reps.sort(key=lambda x: x[0])
+        result[key] = [(s, e) for _, s, e in reps]
+
+    return result
+
+
+def match_recording_to_boundaries(rec_dir, boundaries):
+    """
+    Find the boundary list for a recording directory by matching the last
+    three path components against the keys in the boundaries dict.
+
+    Parameters
+    ----------
+    rec_dir    : path-like — the recording directory
+    boundaries : dict returned by load_rep_boundaries()
+
+    Returns
+    -------
+    list of (start_s, end_s) pairs, or None if no match found.
+    """
+    parts = [p for p in Path(rec_dir).parts if p]
+    if len(parts) < 3:
+        return None
+    key = tuple(parts[-3:])
+    return boundaries.get(key, None)
+
+
+# ---------------------------------------------------------------------------
 # Window utilities
 # ---------------------------------------------------------------------------
 

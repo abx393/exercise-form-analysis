@@ -77,6 +77,8 @@ from signal_utils import (
     lowpass_filter,
     detect_valleys,
     segment_reps,
+    load_rep_boundaries,
+    match_recording_to_boundaries,
 )
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -339,9 +341,16 @@ def process_recording(rec_dir: Path,
                        prominence_factor: float,
                        trim_margin_s: float,
                        rep_length: int,
-                       n_good: int) -> dict | None:
+                       n_good: int,
+                       rep_boundaries=None) -> dict | None:
     """
     Load, segment, normalise, and resample all reps from one recording.
+
+    Parameters
+    ----------
+    rep_boundaries : list of (start_s, end_s) pairs from load_rep_boundaries,
+                     or None to use automatic ACF-based valley detection.
+                     Times are seconds relative to the trimmed window start.
 
     Returns a dict with keys:
         reps        : (N, rep_length) float32 array
@@ -382,19 +391,34 @@ def process_recording(rec_dir: Path,
 
     times = ts - ts[0]
 
-    valley_idx, mag_f, min_sep = detect_valleys(
-        times, xs, ys, zs,
-        lowpass_hz=lowpass_hz,
-        prominence_factor=prominence_factor,
-    )
-    segments = segment_reps(valley_idx)
+    if rep_boundaries is not None:
+        # Convert time-boundary pairs → sample-index pairs
+        print(f"      Using {len(rep_boundaries)} pre-computed rep boundaries")
+        segments = []
+        for start_s, end_s in rep_boundaries:
+            mask = (times >= start_s) & (times < end_s)
+            idx  = np.where(mask)[0]
+            if len(idx) >= 2:
+                segments.append((int(idx[0]), int(idx[-1]) + 1))
+            else:
+                print(f"      [warn] rep [{start_s:.2f}s – {end_s:.2f}s] "
+                      f"has no samples, skipping")
+        # Still need mag_f for normalisation and resampling
+        mag   = np.sqrt(xs**2 + ys**2 + zs**2)
+        mag_f = lowpass_filter(mag, compute_fs(times), lowpass_hz)
+    else:
+        valley_idx, mag_f, min_sep = detect_valleys(
+            times, xs, ys, zs,
+            lowpass_hz=lowpass_hz,
+            prominence_factor=prominence_factor,
+        )
+        segments = segment_reps(valley_idx)
+        print(f"      {len(segments)} reps  (min_sep={min_sep:.2f}s, "
+              f"primary={primary_key})")
 
     if len(segments) < 2:
-        print(f"      [skip] only {len(segments)} rep(s) detected")
+        print(f"      [skip] only {len(segments)} rep(s) detected/loaded")
         return None
-
-    print(f"      {len(segments)} reps  (min_sep={min_sep:.2f}s, "
-          f"primary={primary_key})")
 
     # Normalise magnitude by the good-form rep range
     mag_norm, mn, mx = normalize_recording(mag_f, segments, n_good)
@@ -428,7 +452,8 @@ def load_all_recordings(data_dir: Path,
                          prominence_factor: float,
                          trim_margin_s: float,
                          rep_length: int,
-                         n_good: int) -> dict:
+                         n_good: int,
+                         boundaries_db: dict | None = None) -> dict:
     """
     Walk data_dir/{exercise}/{subject}/{recording_id}/ and process every
     recording.
@@ -460,10 +485,16 @@ def load_all_recordings(data_dir: Path,
                 rec_id = f"{exercise}/{subject}/{rec_dir.name}"
                 print(f"    Recording: {rec_dir.name}")
 
+                rec_boundaries = (
+                    match_recording_to_boundaries(rec_dir, boundaries_db)
+                    if boundaries_db is not None else None
+                )
+
                 result = process_recording(
                     rec_dir, primary_device,
                     lowpass_hz, prominence_factor, trim_margin_s,
                     rep_length, n_good,
+                    rep_boundaries=rec_boundaries,
                 )
                 if result is not None:
                     result['rec_id'] = rec_id
@@ -815,6 +846,11 @@ def main():
                         help='Seconds to trim from each end of the sync '
                              'window to remove startup/shutdown noise '
                              '(default: 2.0)')
+    parser.add_argument('--rep-boundaries', metavar='CSV', default=None,
+                        help='CSV file of pre-computed rep boundaries. When '
+                             'provided, ACF-based segmentation is skipped. '
+                             'Expected columns: relative_path, rep_index, '
+                             'start_s, end_s.')
     parser.add_argument('--save-dir', default='./results',
                         help='Directory for output plots and models '
                              '(default: ./results)')
@@ -830,18 +866,26 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Load rep boundaries if provided
+    boundaries_db = None
+    if args.rep_boundaries:
+        boundaries_db = load_rep_boundaries(args.rep_boundaries)
+        print(f"Loaded rep boundaries for {len(boundaries_db)} recording(s) "
+              f"from {args.rep_boundaries}")
+
     # ------------------------------------------------------------------
     # Load and process all recordings
     # ------------------------------------------------------------------
     print("\nLoading recordings ...")
     data = load_all_recordings(
-        data_dir         = Path(args.data_dir),
-        primary_device   = args.primary_device,
-        lowpass_hz       = args.lowpass_hz,
-        prominence_factor= args.prominence,
-        trim_margin_s    = args.trim_margin,
-        rep_length       = args.rep_length,
-        n_good           = args.n_good,
+        data_dir          = Path(args.data_dir),
+        primary_device    = args.primary_device,
+        lowpass_hz        = args.lowpass_hz,
+        prominence_factor = args.prominence,
+        trim_margin_s     = args.trim_margin,
+        rep_length        = args.rep_length,
+        n_good            = args.n_good,
+        boundaries_db     = boundaries_db,
     )
 
     if not data:

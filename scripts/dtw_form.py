@@ -72,6 +72,8 @@ from signal_utils import (
     bandpass_filter,
     detect_peaks_valleys,
     segment_reps,
+    load_rep_boundaries,
+    match_recording_to_boundaries,
 )
 
 
@@ -532,8 +534,6 @@ def plot_all(devices, segments, per_device_scores, combined_scores,
                      color=color, edgecolor='white', linewidth=0.4,
                      alpha=0.85, zorder=3,
                      label=f"{dev['label']} (w={w[d_i]:.2f})")
-        print('dev', dev)
-        print('weighted[d_i]', weighted[d_i])
         bottoms += weighted[d_i]
 
     # Threshold line and anomaly highlights
@@ -579,13 +579,66 @@ def plot_all(devices, segments, per_device_scores, combined_scores,
 
 
 # ---------------------------------------------------------------------------
+# Evaluation metrics
+# ---------------------------------------------------------------------------
+
+def print_metrics(y_true: np.ndarray, y_pred: np.ndarray,
+                  rec_id: str = '') -> dict:
+    """
+    Print and return precision, recall, F1 for bad-form detection.
+
+    Ground truth: y_true[i] = 1 means rep i is bad form (index >= n_good).
+    Prediction:   y_pred[i] = 1 means rep i was flagged as anomalous.
+
+    If every rep is good form (no bad reps in the recording) metrics are
+    not meaningful — we report that and return None.
+
+    Returns dict with keys precision, recall, f1, n_good_reps, n_bad_reps,
+    or None if evaluation is not possible.
+    """
+    from sklearn.metrics import precision_recall_fscore_support
+
+    n_bad = int(y_true.sum())
+    n_good = int((~y_true.astype(bool)).sum())
+
+    prefix = f"  [{rec_id}] " if rec_id else "  "
+
+    if n_bad == 0:
+        print(f"{prefix}No bad-form reps in this recording "
+              f"(fewer than n_good reps total) — skipping metrics.")
+        return None
+
+    p, r, f, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='binary', zero_division=0)
+
+    print(f"\n{prefix}Evaluation  "
+          f"(ground truth: first {n_good} good, next {n_bad} bad)")
+    print(f"  {'Rep':>4}  {'GT':>6}  {'Pred':>8}  {'Correct':>8}")
+    print("  " + "-" * 32)
+    for i, (gt, pred) in enumerate(zip(y_true, y_pred)):
+        gt_str   = "BAD"  if gt   else "good"
+        pred_str = "FLAG" if pred else "ok"
+        correct  = "✓" if bool(gt) == bool(pred) else "✗"
+        print(f"  {i+1:>4}  {gt_str:>6}  {pred_str:>8}  {correct:>8}")
+
+    print(f"\n  Precision : {p:.3f}")
+    print(f"  Recall    : {r:.3f}")
+    print(f"  F1        : {f:.3f}")
+    print(f"  Flagged   : {int(y_pred.sum())} / {len(y_pred)} reps")
+
+    return {'precision': p, 'recall': r, 'f1': f,
+            'n_good_reps': n_good, 'n_bad_reps': n_bad}
+
+
+# ---------------------------------------------------------------------------
 # Core pipeline (shared by both modes)
 # ---------------------------------------------------------------------------
 
 def run_recording(all_data, labels, primary_idx, weights,
-                  template_reps, anomaly_threshold,
+                  template_reps, anomaly_threshold, n_good,
                   lowpass_hz, min_separation, prominence,
-                  trim_margin, save_png=None, save_bp_png=None,
+                  trim_margin, rep_boundaries=None,
+                  save_png=None, save_bp_png=None,
                   title_prefix=''):
     """
     Run the full DTW form-scoring pipeline on a set of already-loaded
@@ -596,20 +649,22 @@ def run_recording(all_data, labels, primary_idx, weights,
     all_data        : list of dicts with keys label, ts, xs, ys, zs
     labels          : list of device label strings (same order as all_data)
     primary_idx     : index into all_data of the primary segmentation device
-    weights         : 1-D numpy array of per-device weights (will be sliced
-                      to match all_data length and renormalised if needed)
+    weights         : 1-D numpy array of per-device weights
     template_reps   : number of good-form template reps
     anomaly_threshold : sigma multiplier for anomaly threshold
+    n_good          : number of reps considered good form for ground-truth
+                      evaluation. Reps with index >= n_good are labelled bad.
     lowpass_hz, min_separation, prominence, trim_margin : signal params
+    rep_boundaries  : list of (start_s, end_s) pairs from load_rep_boundaries,
+                      or None to use automatic ACF-based segmentation.
+                      Times are in seconds relative to the trimmed window start.
     save_png        : path to save main plot, or None for interactive
     save_bp_png     : path to save bandpass plot, or None for interactive
-    title_prefix    : prepended to plot suptitle (e.g. recording ID)
+    title_prefix    : prepended to plot suptitle
 
     Returns
     -------
-    dict with keys: segments, combined_scores, threshold, anomalous,
-                    per_device_scores, ordered_devices
-    or None on failure.
+    dict with pipeline outputs and evaluation metrics, or None on failure.
     """
     # Sync window
     all_signals = {d['label']: {'ts': d['ts']} for d in all_data}
@@ -661,17 +716,34 @@ def run_recording(all_data, labels, primary_idx, weights,
                         'bp_low_hz':    bp_low_hz,
                         'bp_high_hz':   bp_high_hz})
 
-    # Segmentation on primary device
-    primary = devices[primary_idx]
-    p_label = primary['label']
-    p_valley = primary['valley_idx']
-    p_mag_f  = primary['mag_f']
+    # ------------------------------------------------------------------
+    # Rep segmentation: use provided boundaries or detect automatically
+    # ------------------------------------------------------------------
+    primary  = devices[primary_idx]
+    p_label  = primary['label']
     p_times  = primary['times']
+    p_mag_f  = primary['mag_f']
 
-    print(f"\n  Segmenting reps on primary device: [{p_label}]")
-    segments = segment_reps(p_valley,
-                             n_samples=len(p_mag_f),
-                             n_template=template_reps)
+    if rep_boundaries is not None:
+        # Convert time-boundary pairs → sample-index pairs using the
+        # primary device's time array.  Times in the CSV are seconds from
+        # the trimmed window start, which is exactly what p_times contains.
+        print(f"\n  Using {len(rep_boundaries)} pre-computed rep boundaries")
+        segments = []
+        for start_s, end_s in rep_boundaries:
+            mask      = (p_times >= start_s) & (p_times < end_s)
+            idx       = np.where(mask)[0]
+            if len(idx) >= 2:
+                segments.append((int(idx[0]), int(idx[-1]) + 1))
+            else:
+                print(f"    [warn] rep [{start_s:.2f}s – {end_s:.2f}s] "
+                      f"has no samples in primary device signal, skipping")
+    else:
+        print(f"\n  Segmenting reps on primary device: [{p_label}]")
+        p_valley = primary['valley_idx']
+        segments = segment_reps(p_valley,
+                                 n_samples=len(p_mag_f),
+                                 n_template=template_reps)
 
     if len(segments) < template_reps + 1:
         print(f"  [skip] only {len(segments)} rep(s) detected "
@@ -747,6 +819,12 @@ def run_recording(all_data, labels, primary_idx, weights,
              title_prefix=title_prefix,
              save_path=save_png)
 
+    # Evaluation: ground truth derived from rep index
+    n_reps  = len(segments)
+    y_true  = np.array([i >= n_good for i in range(n_reps)], dtype=int)
+    y_pred  = anomalous.astype(int)
+    metrics = print_metrics(y_true, y_pred, rec_id=title_prefix.strip())
+
     return {
         'segments':          segments,
         'combined_scores':   combined_scores,
@@ -754,6 +832,9 @@ def run_recording(all_data, labels, primary_idx, weights,
         'anomalous':         anomalous,
         'per_device_scores': per_device_scores,
         'ordered_devices':   ordered_devices,
+        'y_true':            y_true,
+        'y_pred':            y_pred,
+        'metrics':           metrics,
     }
 
 
@@ -783,15 +864,25 @@ def main():
     parser.add_argument('--data-dir', metavar='PATH', default=None,
                         help='Root data directory for batch processing. '
                              'Structure: <exercise>/<subject>/<recording_id>/')
-    parser.add_argument('--primary-device', default='headphones',
+    parser.add_argument('--primary-device', default='watch',
                         choices=['watch', 'headphones', 'phone'],
                         help='Primary segmentation device for directory mode '
                              '(default: watch)')
     parser.add_argument('--save-dir', metavar='PATH', default='./dtw_results',
                         help='Output directory for plots in directory mode '
                              '(default: ./dtw_results)')
+    parser.add_argument('--eval-subjects', nargs='+', metavar='SUBJECT',
+                        default=None,
+                        help='Subjects to evaluate in directory mode. '
+                             'If omitted, all subjects are processed. '
+                             'Example: --eval-subjects alice bob')
 
     # Shared args
+    parser.add_argument('--rep-boundaries', metavar='CSV', default=None,
+                        help='CSV file of pre-computed rep boundaries. When '
+                             'provided, ACF-based segmentation is skipped and '
+                             'reps are taken from this file. Expected columns: '
+                             'relative_path, rep_index, start_s, end_s.')
     parser.add_argument('--lowpass-hz', type=float, default=5.0,
                         help='Low-pass filter cutoff (default: 5 Hz)')
     parser.add_argument('--min-separation', type=float, default=None,
@@ -800,6 +891,11 @@ def main():
                         help='Valley prominence factor x IQR (default: 0.5)')
     parser.add_argument('--template-reps', type=int, default=5,
                         help='Good-form template reps (default: 5)')
+    parser.add_argument('--n-good', type=int, default=10,
+                        help='Number of reps considered good form for '
+                             'evaluation. Reps with index >= n-good are '
+                             'treated as bad form in ground truth '
+                             '(default: 10)')
     parser.add_argument('--anomaly-threshold', type=float, default=2.0,
                         help='Sigma multiplier for anomaly threshold '
                              '(default: 2.0)')
@@ -815,6 +911,14 @@ def main():
                         help='Save main plot (file mode only)')
     parser.add_argument('--save-bp-png', metavar='PATH',
                         help='Save bandpass diagnostic plot (file mode only)')
+    parser.add_argument('--subject', metavar='NAME', default=None,
+                        help='Subject name for display in plot titles and '
+                             'metrics headers (file mode only).')
+    parser.add_argument('--session', metavar='NAME', default=None,
+                        help='Session/recording name used to look up rep '
+                             'boundaries in file mode (must match the session '
+                             'component of relative_path in the boundaries CSV). '
+                             'Example: --session bench-press-chandler-2026-april-11-2026-04-12_00-11-36')
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -825,6 +929,13 @@ def main():
                      'not both.')
     if not args.data_dir and not args.files:
         parser.error('Provide either positional CSV files or --data-dir.')
+
+    # Load rep boundaries once if provided (shared by both modes)
+    boundaries_db = None
+    if args.rep_boundaries:
+        boundaries_db = load_rep_boundaries(args.rep_boundaries)
+        print(f"Loaded rep boundaries for {len(boundaries_db)} recording(s) "
+              f"from {args.rep_boundaries}")
 
     # ------------------------------------------------------------------
     # FILE MODE
@@ -859,34 +970,69 @@ def main():
             all_data.append({'label': label,
                              'ts': ts, 'xs': xs, 'ys': ys, 'zs': zs})
 
+        # Look up boundaries for file mode using exercise/subject/session key
+        file_boundaries = None
+        if boundaries_db is not None:
+            if args.subject and args.session:
+                # Try to infer exercise from labels or leave as unknown
+                exercise = labels[0].lower() if labels else 'unknown'
+                key = (exercise, args.subject, args.session)
+                file_boundaries = boundaries_db.get(key)
+                if file_boundaries is None:
+                    # Try matching just by session (last component)
+                    for k, v in boundaries_db.items():
+                        if k[2] == args.session:
+                            file_boundaries = v
+                            break
+                if file_boundaries is None:
+                    print(f"[warn] No rep boundaries found for session "
+                          f"'{args.session}' — falling back to ACF segmentation")
+            else:
+                print("[warn] --rep-boundaries provided but --subject and "
+                      "--session not set — cannot look up recording in file "
+                      "mode. Falling back to ACF segmentation.")
+
+        title = args.subject or ''
         run_recording(
-            all_data        = all_data,
-            labels          = labels,
-            primary_idx     = args.primary,
-            weights         = weights,
-            template_reps   = args.template_reps,
+            all_data          = all_data,
+            labels            = labels,
+            primary_idx       = args.primary,
+            weights           = weights,
+            template_reps     = args.template_reps,
             anomaly_threshold = args.anomaly_threshold,
-            lowpass_hz      = args.lowpass_hz,
-            min_separation  = args.min_separation,
-            prominence      = args.prominence,
-            trim_margin     = args.trim_margin,
-            save_png        = args.save_png,
-            save_bp_png     = args.save_bp_png,
+            n_good            = args.n_good,
+            lowpass_hz        = args.lowpass_hz,
+            min_separation    = args.min_separation,
+            prominence        = args.prominence,
+            trim_margin       = args.trim_margin,
+            rep_boundaries    = file_boundaries,
+            save_png          = args.save_png,
+            save_bp_png       = args.save_bp_png,
+            title_prefix      = f"{title}  " if title else '',
         )
 
     # ------------------------------------------------------------------
     # DIRECTORY MODE
     # ------------------------------------------------------------------
     else:
-        data_dir = Path(args.data_dir)
-        save_dir = Path(args.save_dir)
+        data_dir      = Path(args.data_dir)
+        save_dir      = Path(args.save_dir)
+        eval_subjects = set(args.eval_subjects) if args.eval_subjects else None
         save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect metrics across all recordings for an aggregate summary
+        all_metrics = []   # list of (rec_id, metrics_dict)
 
         for ex_dir in sorted(p for p in data_dir.iterdir() if p.is_dir()):
             exercise = ex_dir.name
             for subj_dir in sorted(p for p in ex_dir.iterdir()
                                    if p.is_dir()):
                 subject = subj_dir.name
+
+                # Filter to requested subjects if --eval-subjects given
+                if eval_subjects and subject not in eval_subjects:
+                    continue
+
                 for rec_dir in sorted(p for p in subj_dir.iterdir()
                                       if p.is_dir()):
                     rec_id = f"{exercise}/{subject}/{rec_dir.name}"
@@ -899,11 +1045,10 @@ def main():
                         print("  [skip] no recognised sensor files")
                         continue
 
-                    # Build all_data list from signals dict;
-                    # resolve primary device index
-                    all_data     = []
-                    primary_idx  = 0
-                    primary_key  = (args.primary_device, 'accel')
+                    # Build all_data list; resolve primary device index
+                    all_data    = []
+                    primary_idx = 0
+                    primary_key = (args.primary_device, 'accel')
                     for key, d in signals.items():
                         dev_label = f"{key[0]}_{key[1]}"
                         all_data.append({
@@ -911,36 +1056,79 @@ def main():
                             'ts': d['ts'], 'xs': d['xs'],
                             'ys': d['ys'], 'zs': d['zs'],
                         })
-                    # Find primary device index; fall back to 0
                     for i, key in enumerate(signals.keys()):
                         if key == primary_key:
                             primary_idx = i
                             break
 
-                    weights = np.ones(len(all_data)) / len(all_data)
+                    weights  = np.ones(len(all_data)) / len(all_data)
+                    rec_slug = rec_id.replace('/', '_')
+                    save_png = save_dir / f"{rec_slug}_scores.png"
+                    save_bp  = save_dir / f"{rec_slug}_bandpass.png"
 
-                    # Build output paths
-                    rec_slug  = rec_id.replace('/', '_')
-                    save_png  = save_dir / f"{rec_slug}_scores.png"
-                    save_bp   = save_dir / f"{rec_slug}_bandpass.png"
+                    # Look up pre-computed boundaries for this recording
+                    rec_boundaries = None
+                    if boundaries_db is not None:
+                        rec_boundaries = match_recording_to_boundaries(
+                            rec_dir, boundaries_db)
+                        if rec_boundaries is None:
+                            print("  [warn] no boundaries found for this "
+                                  "recording — falling back to ACF segmentation")
 
-                    run_recording(
+                    result = run_recording(
                         all_data          = all_data,
                         labels            = [d['label'] for d in all_data],
                         primary_idx       = primary_idx,
                         weights           = weights,
                         template_reps     = args.template_reps,
                         anomaly_threshold = args.anomaly_threshold,
+                        n_good            = args.n_good,
                         lowpass_hz        = args.lowpass_hz,
                         min_separation    = args.min_separation,
                         prominence        = args.prominence,
                         trim_margin       = args.trim_margin,
+                        rep_boundaries    = rec_boundaries,
                         save_png          = str(save_png),
                         save_bp_png       = str(save_bp),
                         title_prefix      = f"{rec_id}  ",
                     )
 
+                    if result and result['metrics']:
+                        all_metrics.append((rec_id, result['metrics']))
+
+        # ------------------------------------------------------------------
+        # Aggregate summary across all processed recordings
+        # ------------------------------------------------------------------
+        if all_metrics:
+            print(f"\n{'='*60}")
+            print("AGGREGATE EVALUATION SUMMARY")
+            print(f"{'='*60}")
+
+            col = max(len(r) for r, _ in all_metrics) + 2
+            print(f"  {'Recording':<{col}}  {'P':>6}  {'R':>6}  {'F1':>6}  "
+                  f"{'Good':>6}  {'Bad':>5}")
+            print("  " + "-" * (col + 36))
+            for rec_id, m in all_metrics:
+                print(f"  {rec_id:<{col}}  "
+                      f"{m['precision']:>6.3f}  "
+                      f"{m['recall']:>6.3f}  "
+                      f"{m['f1']:>6.3f}  "
+                      f"{m['n_good_reps']:>6}  "
+                      f"{m['n_bad_reps']:>5}")
+
+            ps = [m['precision'] for _, m in all_metrics]
+            rs = [m['recall']    for _, m in all_metrics]
+            fs = [m['f1']        for _, m in all_metrics]
+            print("  " + "-" * (col + 36))
+            print(f"  {'Mean (macro)':<{col}}  "
+                  f"{np.mean(ps):>6.3f}  "
+                  f"{np.mean(rs):>6.3f}  "
+                  f"{np.mean(fs):>6.3f}")
+            print(f"\n  Processed {len(all_metrics)} recording(s) with "
+                  f"evaluable bad-form reps.")
+
 
 if __name__ == '__main__':
     main()
+
 
