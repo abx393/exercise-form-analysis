@@ -504,6 +504,37 @@ def run_loso_cv(rows, labels, group_ids, n_estimators=200, random_state=42):
 # Final model (trained on all data)
 # ---------------------------------------------------------------------------
 
+def plot_feature_dim_reduction(X, labels, random_state):
+    from matplotlib.patches import Patch
+
+    tsne = TSNE(n_components=2, perplexity=30, random_state=random_state)
+    X_embedded = tsne.fit_transform(X)
+
+    cmap = {
+        'pushups': 'blue',
+        'pullups': 'green',
+        'situps': 'black',
+        'lunges': 'red',
+        'squats': 'purple',
+        'bench': 'brown'
+    }
+
+    colors = [cmap[label] for label in labels]
+
+    plt.scatter(X_embedded[:, 0], X_embedded[:, 1], c=colors)
+
+    # Create legend manually
+    legend_handles = [
+         Patch(color=color, label=label)
+             for label, color in cmap.items()
+    ]
+    
+    plt.legend(handles=legend_handles, title="Exercise")
+    plt.title("2D t-SNE Dimensionality Reduction of Exercise Features")
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.show()
+
 def train_final_model(rows, labels, group_ids,
                       n_estimators=200, random_state=42):
     """
@@ -515,17 +546,11 @@ def train_final_model(rows, labels, group_ids,
 
     Returns (clf, feature_names, imputer).
     """
+
     X, y, g, feature_names, imputer = _build_matrices(
         rows, labels, group_ids)
-    tsne = TSNE(n_components=2, perplexity=30, random_state=random_state)
-    X_embedded = tsne.fit_transform(X)
-    cmap = {'pushups': 'blue', 'pullups': 'green', 'situps': 'black',
-            'lunges': 'red', 'squats': 'purple', 'bench': 'brown'}
-    colors = [cmap[label] for label in labels]
-    scatter = plt.scatter(X_embedded[:, 0], X_embedded[:, 1], c=colors)
-    #plt.colorbar()
-    plt.title("2D t-SNE Dimensionality Reduction of Exercise Features")
-    plt.show()
+
+    plot_feature_dim_reduction(X, labels, random_state)
 
     clf = RandomForestClassifier(
         n_estimators=n_estimators,
